@@ -406,14 +406,19 @@ async def build_report(
     )
     content = resp.choices[0].message.content
     if not isinstance(content, str):
-        # Some models return content as a list of blocks (thinking/text); keep text blocks only.
+        # Some models return content as a list of blocks (thinking/text chunks, possibly SDK
+        # objects rather than plain dicts); keep only the text blocks.
         parts = []
         for block in content or []:
             if isinstance(block, str):
                 parts.append(block)
-            elif isinstance(block, dict) and isinstance(block.get("text"), str):
-                parts.append(block["text"])
+                continue
+            txt = block.get("text") if isinstance(block, dict) else getattr(block, "text", None)
+            if isinstance(txt, str):
+                parts.append(txt)
         content = chr(10).join(p for p in parts if p)
+    if not content:
+        raise RuntimeError("LLM returned empty report content")
     return content
 
 
