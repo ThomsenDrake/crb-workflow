@@ -24,7 +24,6 @@ from mistralai.workflows import Depends
 from mistralai.workflows.client import get_mistral_client
 
 from . import odds_math as om
-from . import sources as live_sources
 from .models import (
     BestLine,
     GameProjection,
@@ -58,7 +57,14 @@ def _side(american: int) -> dict:
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=10))
 async def ingest_live_odds(specs: list[dict]) -> IngestionResult:
-    """Pull the live slate and per-book odds from public sources (ESPN unless configured)."""
+    """Pull the live slate and per-book odds from public sources (ESPN unless configured).
+
+    The sources module imports httpx, so it is imported here, inside the activity:
+    workflow modules must stay importable inside the workflow sandbox, which rejects
+    modules that touch restricted stdlib APIs (urllib.request) at import time.
+    """
+    from . import sources as live_sources
+
     parsed = [SourceSpec(**s) for s in specs]
     return await live_sources.ingest(parsed)
 
