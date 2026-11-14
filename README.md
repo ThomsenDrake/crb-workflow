@@ -26,7 +26,7 @@ Then it computes:
 
 ~~~mermaid
 flowchart LR
-    A[ingest_live_odds<br/>ESPN slate + per-book odds] --> B[normalize_odds<br/>American to decimal + implied]
+    A[ingest_live_odds<br/>ESPN slate + per-book odds + team injuries/news] --> B[normalize_odds<br/>American to decimal + implied]
     B --> C[compute_consensus<br/>devig power k=2, avg across books]
     C --> D[line_shop<br/>best price + best number per side]
     E[project_games<br/>LLM FBS projections] --> F[evaluate_edges<br/>cover/win/over prob to edge, EV]
@@ -44,7 +44,9 @@ The built-in "espn" source needs no API key and uses ESPN's public endpoints:
 - Slate: https://site.api.espn.com/apis/site/v2/sports/football/college-football/scoreboard with params "dates" (YYYYMMDD, America/New_York), "groups" (80 = all FBS), "limit", optional "seasontype"
 - Per-sportsbook lines: https://sports.core.api.espn.com/v2/sports/football/leagues/college-football/events/{event_id}/competitions/{competition_id}/odds — one entry per book with spread, moneyline and over/under in American odds
 
-Each scheduled game with at least one sportsbook becomes a "GameOdds" ("game_id" = "espn-{event_id}"). Finished games are always skipped; in-progress games are skipped unless "include_in_progress" is true. The output's "ingestion" field records what was fetched (sources, fetched_at_utc, events_scanned, games_with_odds, books_seen, detail).
+- Qualitative team context (when "include_team_context" is true): per-team injuries and latest news headlines from https://site.api.espn.com/apis/site/v2/sports/football/college-football/teams/{team_id}/injuries and .../teams/{team_id}/news — attached to each game as "home_context"/"away_context", weighed by the LLM in "project_games", and surfaced as per-game team notes in the report
+
+Each scheduled game with at least one sportsbook becomes a "GameOdds" ("game_id" = "espn-{event_id}"). Finished games are always skipped; in-progress games are skipped unless "include_in_progress" is true. Provider aliases such as "DraftKings - Live Odds" are normalized to the base book name. The output's "ingestion" field records what was fetched (sources, fetched_at_utc, events_scanned, games_with_odds, books_seen, detail, warnings).
 
 Default input ("examples/sample_input.json"):
 
@@ -74,6 +76,7 @@ Default input ("examples/sample_input.json"):
 | "per_book" | true | fetch each sportsbook's own lines (core odds API); false = scoreboard consensus only |
 | "include_in_progress" | false | also ingest in-progress games |
 | "providers" | all | allow-list of sportsbook names (case-insensitive) |
+| "include_team_context" | true | also fetch per-team injuries + news headlines |
 | "timeout_seconds" | 20 | per-request timeout |
 | "max_concurrency" | 8 | parallel requests |
 
@@ -86,7 +89,8 @@ apps/worker/
   pyproject.toml                        # worker package (mistralai-workflows[mistralai] + pydantic + httpx)
   src/worker/entrypoints/worker.py      # discovers worker.workflows and runs the worker
   src/worker/workflows/models.py        # input/output pydantic models (incl. SourceSpec)
-  src/worker/workflows/sources.py       # live ingestion: ESPN slate + per-book odds
+  src/worker/workflows/sources.py       # live ingestion: ESPN slate + per-book odds + team injuries/news
+  tests/                                # pytest suite for the pure helpers (odds math, parsing, models)
   src/worker/workflows/odds_math.py     # pure odds math (american/decimal, devig, EV, Kelly)
   src/worker/workflows/line_shopper.py  # the 8 activities + workflow class
 deploy/docker/Dockerfile.worker         # managed-deployment image (build context = repo root)
@@ -141,10 +145,11 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 | "kelly_fraction" | float | 0.25 | fraction of full Kelly to stake (¼ Kelly) |
 | "max_stake_pct" | float | 0.05 | hard cap on any single bet, as % of bankroll |
 | "max_exposure_pct" | float | 0.25 | hard cap on total simultaneous stake, as % of bankroll |
+| "max_game_exposure_pct" | float | 0.05 | hard cap on total stake for any single game (correlation guard), as % of bankroll |
 | "min_edge" | float | 0.01 | minimum edge (model prob − fair prob) to size a bet |
 | "model" | string | "mistral-large-latest" | model for projections and the report |
 
-"GameOdds": "game_id", "home_team", "away_team", "kickoff_utc", "books" (list of "BookOdds"), optional "projection" (if omitted, the workflow generates one with the LLM). See "examples/sample_input_fixed.json" for a complete explicit-slate example.
+"GameOdds": "game_id", "home_team", "away_team", "kickoff_utc", "books" (list of "BookOdds"), optional "projection" (if omitted, the workflow generates one with the LLM), optional "home_context"/"away_context" ("TeamContext": "injuries", "news"; populated by live ingestion). See "examples/sample_input_fixed.json" for a complete explicit-slate example.
 
 "BookOdds": "book", and any of:
 
@@ -154,11 +159,12 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 
 ## Output schema ("LineShopperOutput")
 
-- "ingestion": what the live fetch returned (sources, fetched_at_utc, events_scanned, games_with_odds, books_seen, detail); null for explicit slates
-- "results": per game — "matchup", "projection", "consensus", and "picks": one "BestLine" per market/side with "book", "line", "american_odds", "decimal_odds", "implied_prob", "consensus_fair_prob", "model_prob", "edge", "ev_per_unit", "qualifies", "stake"
+- "ingestion": what the live fetch returned (sources, fetched_at_utc, events_scanned, games_with_odds, books_seen, detail, warnings); null for explicit slates
+- "results": per game — "matchup", "projection", "consensus", and "picks": one "BestLine" per market/side with "book", "line", "american_odds", "decimal_odds", "implied_prob", "breakeven_decimal" (fair odds = 1/model_prob), "consensus_fair_prob", "model_prob", "edge", "ev_per_unit", "qualifies", "stake"
 - "total_stake", "bankroll"
-- "report_markdown": human-readable report
+- "report_markdown": human-readable report (includes per-game team notes when context was ingested)
 - "disclaimer": responsible-gambling text
+- "warnings": non-fatal issues (e.g. team-context fetch failures, LLM fallback projections)
 
 ## The math
 

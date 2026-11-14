@@ -30,6 +30,7 @@ from .models import (
     MoneylineOdds,
     SourceSpec,
     SpreadOdds,
+    TeamContext,
     TotalOdds,
 )
 
@@ -67,17 +68,23 @@ def _as_float(value: object) -> float | None:
         return None
 
 
+def _normalize_book_name(name: str) -> str:
+    """Collapse provider aliases like "DraftKings - Live Odds" onto the base book name."""
+    base = name.split(" - ")[0].strip()
+    return base or name.strip()
+
+
 def _provider_ok(book: str, providers: list[str] | None) -> bool:
     if not providers:
         return True
     wanted = {p.strip().lower() for p in providers}
-    return book.strip().lower() in wanted
+    return _normalize_book_name(book).strip().lower() in wanted
 
 
 def _book_from_espn_odds_item(item: dict, fetched_at_utc: str) -> BookOdds | None:
     """Map one ESPN per-sportsbook odds item onto BookOdds. None if no usable market."""
     provider = item.get("provider") or {}
-    book = str(provider.get("name") or "unknown")
+    book = _normalize_book_name(str(provider.get("name") or "unknown"))
     away = item.get("awayTeamOdds") or {}
     home = item.get("homeTeamOdds") or {}
 
@@ -129,6 +136,81 @@ async def _get_json(client: httpx.AsyncClient, url: str, params: dict | None, se
         if last_exc is not None:
             raise last_exc
         raise RuntimeError("request failed: " + url)
+
+
+def _parse_injuries(data: object, limit: int = 12) -> list[str]:
+    """Flatten ESPN's team-injuries payload into "Player (POS) - status: detail" strings."""
+    if not isinstance(data, dict):
+        return []
+    out: list[str] = []
+    athletes = data.get("athletes")
+    if not isinstance(athletes, list):
+        return out
+    for athlete in athletes:
+        if not isinstance(athlete, dict):
+            continue
+        injuries = athlete.get("injuries")
+        if not isinstance(injuries, list) or not injuries:
+            continue
+        name = str(athlete.get("displayName") or athlete.get("shortName") or "unknown")
+        pos = (athlete.get("position") or {}).get("abbreviation") if isinstance(athlete.get("position"), dict) else None
+        label = f"{name} ({pos})" if pos else name
+        for inj in injuries:
+            if not isinstance(inj, dict):
+                continue
+            status = str(inj.get("status") or "").strip()
+            detail = str(inj.get("detail") or inj.get("type") or "").strip()
+            if not status and not detail:
+                continue
+            entry = f"{label} - {status}" if status else label
+            if detail:
+                entry += f": {detail}"
+            out.append(entry)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+def _parse_news(data: object, limit: int = 6) -> list[str]:
+    """Latest news headlines for a team from ESPN's team-news payload."""
+    if not isinstance(data, dict):
+        return []
+    articles = data.get("articles")
+    if not isinstance(articles, list):
+        return []
+    out: list[str] = []
+    for article in articles:
+        if not isinstance(article, dict):
+            continue
+        headline = str(article.get("headline") or "").strip()
+        if headline:
+            out.append(headline)
+        if len(out) >= limit:
+            break
+    return out[:limit]
+
+
+async def _fetch_team_context(
+    client: httpx.AsyncClient,
+    team_id: str,
+    sem: asyncio.Semaphore,
+    warnings: list[str],
+) -> TeamContext:
+    """Per-team qualitative data (injuries + news) from ESPN's public team endpoints."""
+    base = ESPN_SCOREBOARD_URL.rsplit("/scoreboard", 1)[0]
+    injuries_url = f"{base}/teams/{team_id}/injuries"
+    news_url = f"{base}/teams/{team_id}/news"
+    injuries: list[str] = []
+    news: list[str] = []
+    try:
+        injuries = _parse_injuries(await _get_json(client, injuries_url, None, sem))
+    except Exception as exc:
+        warnings.append(f"injuries fetch failed for team {team_id}: {exc}")
+    try:
+        news = _parse_news(await _get_json(client, news_url, {"limit": 6}, sem))
+    except Exception as exc:
+        warnings.append(f"news fetch failed for team {team_id}: {exc}")
+    return TeamContext(injuries=injuries, news=news)
 
 
 async def _fetch_scoreboard_events(client: httpx.AsyncClient, spec: SourceSpec, sem: asyncio.Semaphore) -> list:
@@ -210,6 +292,7 @@ async def fetch_espn(spec: SourceSpec) -> IngestionResult:
             allowed.add("in")
         games: list[GameOdds] = []
         scanned = 0
+        team_ids_by_game: dict[str, tuple[str, str]] = {}
         for ev in events:
             if not isinstance(ev, dict):
                 continue
@@ -223,14 +306,21 @@ async def fetch_espn(spec: SourceSpec) -> IngestionResult:
             comp = comps[0]
             home = None
             away = None
+            home_id = ""
+            away_id = ""
             for c in comp.get("competitors") or []:
                 team = (c.get("team") or {}).get("displayName") or "unknown"
+                tid = str(c.get("id") or "")
                 if c.get("homeAway") == "home":
                     home = team
+                    home_id = tid
                 else:
                     away = team
+                    away_id = tid
             if not home or not away:
                 continue
+            if home_id and away_id:
+                team_ids_by_game["espn-" + str(ev.get("id"))] = (home_id, away_id)
             event_id = ev.get("id")
             comp_id = comp.get("id") or event_id
             books: list[BookOdds] = []
@@ -265,6 +355,20 @@ async def fetch_espn(spec: SourceSpec) -> IngestionResult:
                     books=uniq,
                 )
             )
+        warnings: list[str] = []
+        if spec.include_team_context and team_ids_by_game:
+            unique_team_ids = sorted({tid for pair in team_ids_by_game.values() for tid in pair})
+            contexts = await asyncio.gather(
+                *(_fetch_team_context(client, tid, sem, warnings) for tid in unique_team_ids)
+            )
+            context_by_team = dict(zip(unique_team_ids, contexts))
+            for g in games:
+                pair = team_ids_by_game.get(g.game_id)
+                if not pair:
+                    continue
+                home_id, away_id = pair
+                g.home_context = context_by_team.get(home_id)
+                g.away_context = context_by_team.get(away_id)
     books_seen = sorted({b.book for g in games for b in g.books})
     groups_desc = ",".join(str(g) for g in (spec.groups or [80]))
     info = IngestionInfo(
@@ -274,7 +378,9 @@ async def fetch_espn(spec: SourceSpec) -> IngestionResult:
         games_with_odds=len(games),
         books_seen=books_seen,
         detail="ESPN scoreboard dates=" + _espn_date(spec.date) + " groups=" + groups_desc
-        + (" per-book lines from ESPN core odds API" if spec.per_book else " consensus lines only"),
+        + (" per-book lines from ESPN core odds API" if spec.per_book else " consensus lines only")
+        + (" + per-team injuries/news" if spec.include_team_context else ""),
+        warnings=warnings,
     )
     return IngestionResult(games=games, info=info)
 
@@ -305,5 +411,6 @@ async def ingest(specs: list[SourceSpec]) -> IngestionResult:
         games_with_odds=len(games),
         books_seen=sorted({b for i in infos for b in i.books_seen}),
         detail="; ".join(i.detail for i in infos),
+        warnings=[w for i in infos for w in i.warnings],
     )
     return IngestionResult(games=games, info=merged)

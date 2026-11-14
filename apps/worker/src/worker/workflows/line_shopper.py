@@ -33,6 +33,7 @@ from .models import (
     IngestionResult,
     LineShopperInput,
     LineShopperOutput,
+    ProjectGamesResult,
     Projection,
     SourceSpec,
 )
@@ -245,8 +246,13 @@ async def project_games(
     input: LineShopperInput,
     model: str,
     client=Depends(get_chat_client),
-) -> list[GameProjection]:
-    """Build a projection per game: caller-supplied if present, otherwise LLM-generated."""
+) -> ProjectGamesResult:
+    """Build a projection per game: caller-supplied if present, otherwise LLM-generated.
+
+    LLM-generated projections also weigh the qualitative team context (injuries, news
+    headlines) attached to each game during ingestion.
+    """
+    warnings: list[str] = []
     result: dict[str, Projection] = {
         g.game_id: g.projection for g in input.games if g.projection is not None
     }
@@ -256,6 +262,8 @@ async def project_games(
             "home_team": g.home_team,
             "away_team": g.away_team,
             "kickoff_utc": g.kickoff_utc,
+            "home_context": g.home_context.model_dump(mode="json") if g.home_context else None,
+            "away_context": g.away_context.model_dump(mode="json") if g.away_context else None,
         }
         for g in input.games
         if g.projection is None
@@ -268,7 +276,11 @@ async def project_games(
             "expected_total (combined points), total_std (use 10-13 for FBS), home_win_prob "
             "(consistent with P(margin > 0) under a normal distribution), confidence in [0,1], "
             "and short notes. Do not reference betting lines or odds - you do not have them. "
-            "Be honest about uncertainty. Return structured output only."
+            "Each game may include qualitative context per team (injuries with status, recent "
+            "news headlines): weigh it explicitly - key injuries (especially QB/WR/OL) should "
+            "shift expected_margin/expected_total, widen the stds, and lower confidence; coaching "
+            "or motivation news should adjust margin and confidence. Be honest about uncertainty. "
+            "Return structured output only."
         )
         user = "Games (JSON):" + chr(10) + json.dumps(missing, indent=2)
         try:
@@ -281,10 +293,17 @@ async def project_games(
                 response_format=GameProjections,
             )
             parsed = resp.choices[0].message.parsed
+            if parsed is None:
+                raise RuntimeError("LLM returned no parsed projections")
             for gp in parsed.projections:
                 result[gp.game_id] = gp.projection
-        except Exception:
-            pass  # fall through to neutral defaults below
+        except Exception as exc:
+            warnings.append(f"project_games LLM call failed ({exc!r}); using neutral fallback projections")
+    fallbacks = [m["game_id"] for m in missing if m["game_id"] not in result]
+    if fallbacks:
+        warnings.append(
+            "Neutral fallback projection used for " + str(len(fallbacks)) + " game(s): " + ", ".join(fallbacks)
+        )
     for m in missing:
         if m["game_id"] not in result:
             result[m["game_id"]] = Projection(
@@ -296,7 +315,10 @@ async def project_games(
                 confidence=0.2,
                 notes="Fallback neutral projection (LLM call failed or omitted); treat edge estimates as unreliable.",
             )
-    return [GameProjection(game_id=gid, projection=proj) for gid, proj in result.items()]
+    return ProjectGamesResult(
+        projections=[GameProjection(game_id=gid, projection=proj) for gid, proj in result.items()],
+        warnings=warnings,
+    )
 
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=2))
@@ -342,10 +364,12 @@ async def size_stakes(
     kelly_fraction: float,
     max_stake_pct: float,
     max_exposure_pct: float,
+    max_game_exposure_pct: float,
     projections: list[GameProjection],
     consensus: list[dict],
 ) -> list[GameResult]:
-    """Fractional Kelly stakes with a per-bet hard cap and a total-exposure cap."""
+    """Fractional Kelly stakes with a per-bet cap, a per-game cap (correlation guard),
+    and a total-exposure cap."""
     proj_by_game = {p.game_id: p.projection for p in projections}
     cons_by_game = {c["game_id"]: c for c in consensus}
     results: list[GameResult] = []
@@ -360,8 +384,15 @@ async def size_stakes(
             q["american_odds"] = q.pop("american")
             q["decimal_odds"] = q.pop("decimal")
             q["implied_prob"] = q.pop("implied")
+            q["breakeven_decimal"] = round(1.0 / p["model_prob"], 6) if p["model_prob"] > 0 else 0.0
             q["stake"] = stake
             picks.append(BestLine(**q))
+        game_total = sum(p.stake for p in picks)
+        game_cap = max_game_exposure_pct * bankroll
+        if game_total > game_cap > 0:
+            scale = game_cap / game_total
+            for p in picks:
+                p.stake = round(p.stake * scale, 2)
         results.append(
             GameResult(
                 game_id=g["game_id"],
@@ -388,20 +419,55 @@ async def build_report(
     model: str,
     client=Depends(get_chat_client),
 ) -> str:
-    """LLM-written Markdown report; numbers come only from the structured results."""
+    """LLM-written Markdown report; numbers come only from the structured results.
+
+    The prompt carries a compact payload (qualifying picks plus qualitative team context per
+    game) instead of the full structured dump, which keeps the chat-completions request small
+    enough to stay well inside the HTTP timeout on big slates.
+    """
     system = (
         "You write concise Markdown betting-analysis reports from structured JSON. Rules: use "
         "ONLY the numbers in the provided JSON and never invent figures; for each game show the "
         "best line per market (book, line, American odds), the devigged consensus fair probability, "
         "the model probability, edge, EV per unit staked, and recommended stake; sort picks by edge "
-        "descending; include a short methodology section (live line shopping across books, power-method "
-        "devig k=2, normal-approximation cover/over probabilities, fractional Kelly with caps) and a "
-        "'Risks & guardrails' section; end with the provided disclaimer verbatim. Never promise or "
-        "imply guaranteed wins."
+        "descending; when a game has 'context' (team injuries/news), add one short 'Team notes' line "
+        "summarizing the qualitative factors and how they shaped the projection - never invent "
+        "injuries or news; include a short methodology section (live line shopping across books, "
+        "power-method devig k=2, normal-approximation cover/over probabilities, fractional Kelly "
+        "with caps) and a 'Risks & guardrails' section; end with the provided disclaimer verbatim. "
+        "Never promise or imply guaranteed wins."
     )
+    games_by_id = {g.game_id: g for g in input.games or []}
+    compact_games = []
+    for r in results:
+        g = games_by_id.get(r.game_id)
+        context: dict = {}
+        if g is not None:
+            if g.home_context is not None:
+                context["home"] = g.home_context.model_dump(mode="json")
+            if g.away_context is not None:
+                context["away"] = g.away_context.model_dump(mode="json")
+        pick_fields = (
+            "market", "side", "label", "book", "line", "american_odds", "breakeven_decimal",
+            "consensus_fair_prob", "model_prob", "edge", "ev_per_unit", "stake",
+        )
+        compact_games.append(
+            {
+                "game_id": r.game_id,
+                "matchup": r.matchup,
+                "projection": r.projection.model_dump(mode="json") if r.projection is not None else None,
+                "consensus": r.consensus,
+                "context": context,
+                "picks": [
+                    {k: p.model_dump(mode="json")[k] for k in pick_fields}
+                    for p in r.picks
+                    if p.stake > 0
+                ],
+            }
+        )
     payload = {
         "bankroll": input.bankroll,
-        "games": [r.model_dump(mode="json") for r in results],
+        "games": compact_games,
         "disclaimer": DISCLAIMER,
     }
     resp = await client.chat.complete_async(
@@ -462,7 +528,10 @@ class NcaaD1BestLineWorkflow:
         normalized = await normalize_odds(input)
         consensus = await compute_consensus(normalized)
         best_lines = await line_shop(normalized, consensus)
-        projections = await project_games(input, input.model)
+        proj_res = await project_games(input, input.model)
+        projections = proj_res.projections
+        warnings = list(ingestion.warnings) if ingestion is not None else []
+        warnings.extend(proj_res.warnings)
         evaluated = await evaluate_edges(best_lines, projections, input.min_edge)
         results = await size_stakes(
             evaluated,
@@ -470,6 +539,7 @@ class NcaaD1BestLineWorkflow:
             input.kelly_fraction,
             input.max_stake_pct,
             input.max_exposure_pct,
+            input.max_game_exposure_pct,
             projections,
             consensus,
         )
@@ -482,4 +552,5 @@ class NcaaD1BestLineWorkflow:
             report_markdown=report,
             disclaimer=DISCLAIMER,
             ingestion=ingestion,
+            warnings=warnings,
         )

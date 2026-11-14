@@ -59,6 +59,13 @@ class Projection(BaseModel):
     notes: str = ""
 
 
+class TeamContext(BaseModel):
+    """Qualitative, non-odds information about one team (injuries, news headlines)."""
+
+    injuries: list[str] = Field(default_factory=list)
+    news: list[str] = Field(default_factory=list)
+
+
 class GameOdds(BaseModel):
     game_id: str
     home_team: str
@@ -66,6 +73,8 @@ class GameOdds(BaseModel):
     kickoff_utc: str = ""
     books: list[BookOdds] = Field(..., min_length=1)
     projection: Projection | None = None
+    home_context: TeamContext | None = None
+    away_context: TeamContext | None = None
 
 
 class SourceSpec(BaseModel):
@@ -79,6 +88,7 @@ class SourceSpec(BaseModel):
     per_book: bool = True  # fetch each sportsbook's own lines via the ESPN core odds API
     include_in_progress: bool = False  # also ingest games already in progress
     providers: list[str] | None = None  # keep only these sportsbooks (case-insensitive)
+    include_team_context: bool = True  # also fetch per-team injuries + news headlines (ESPN)
     timeout_seconds: float = Field(20.0, gt=0)
     max_concurrency: int = Field(8, ge=1, le=32)
 
@@ -92,6 +102,7 @@ class IngestionInfo(BaseModel):
     games_with_odds: int = 0
     books_seen: list[str] = Field(default_factory=list)
     detail: str = ""
+    warnings: list[str] = Field(default_factory=list)
 
 
 class IngestionResult(BaseModel):
@@ -110,6 +121,7 @@ class LineShopperInput(BaseModel):
     kelly_fraction: float = Field(0.25, gt=0, le=1, description="Fraction of full Kelly to stake (0.25 = quarter Kelly)")
     max_stake_pct: float = Field(0.05, gt=0, le=0.25, description="Hard cap on any single bet, as a fraction of bankroll")
     max_exposure_pct: float = Field(0.25, gt=0, le=1, description="Hard cap on total simultaneous stake, as a fraction of bankroll")
+    max_game_exposure_pct: float = Field(0.05, gt=0, le=0.25, description="Hard cap on total stake for any single game (correlation guard), as a fraction of bankroll")
     min_edge: float = Field(0.01, ge=0, description="Minimum edge (model prob - fair prob) required to size a bet")
     model: str = "mistral-large-latest"
 
@@ -128,6 +140,7 @@ class BestLine(BaseModel):
     american_odds: int
     decimal_odds: float
     implied_prob: float  # raw implied prob at the best price (includes vig)
+    breakeven_decimal: float  # fair decimal odds = 1 / model_prob; the price needed for a fair bet
     consensus_fair_prob: float  # devigged market consensus for this side
     model_prob: float  # model probability of this side winning the bet
     edge: float  # model_prob - consensus_fair_prob
@@ -152,6 +165,7 @@ class LineShopperOutput(BaseModel):
     report_markdown: str
     disclaimer: str
     ingestion: IngestionInfo | None = None
+    warnings: list[str] = Field(default_factory=list)
 
 
 # --------------------------- LLM structured output ---------------------------
@@ -164,3 +178,8 @@ class GameProjection(BaseModel):
 
 class GameProjections(BaseModel):
     projections: list[GameProjection]
+
+
+class ProjectGamesResult(BaseModel):
+    projections: list[GameProjection]
+    warnings: list[str] = Field(default_factory=list)
