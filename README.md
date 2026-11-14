@@ -83,12 +83,13 @@ To target specific conferences, pass their ESPN conference group ids in "groups"
 
 ~~~
 apps/worker/
-  pyproject.toml                        # worker package (mistralai + pydantic + httpx)
+  pyproject.toml                        # worker package (mistralai-workflows[mistralai] + pydantic + httpx)
   src/worker/entrypoints/worker.py      # discovers worker.workflows and runs the worker
   src/worker/workflows/models.py        # input/output pydantic models (incl. SourceSpec)
   src/worker/workflows/sources.py       # live ingestion: ESPN slate + per-book odds
   src/worker/workflows/odds_math.py     # pure odds math (american/decimal, devig, EV, Kelly)
   src/worker/workflows/line_shopper.py  # the 8 activities + workflow class
+deploy/docker/Dockerfile.worker         # managed-deployment image (build context = repo root)
 examples/
   run_execution.py                      # trigger an execution (optional arg: input file)
   sample_input.json                     # live ESPN FBS slate for today (default)
@@ -96,12 +97,24 @@ examples/
 .env.example
 ~~~
 
-## Quickstart
+## Quickstart (run the worker locally)
 
 1. **Prereqs:** a Mistral API key, the Mistral CLI ("mistral") with Bun, "uv", Python ≥ 3.12.
 2. Clone this repo, then "cp .env.example .env" and set "MISTRAL_API_KEY".
 3. From the repo root, start the worker: "mistral dev" (it auto-discovers "ncaa-d1-best-line").
-4. In a second terminal: "python examples/run_execution.py" (live slate) or "python examples/run_execution.py examples/sample_input_fixed.json" (fixed slate) — or trigger it from the Studio console, or via the SDK:
+4. In a second terminal: "python examples/run_execution.py" (live slate) or "python examples/run_execution.py examples/sample_input_fixed.json" (fixed slate).
+
+To run the worker without the CLI: "cd apps/worker && uv sync" then "PYTHONPATH=src uv run python -m worker.entrypoints.worker".
+
+## Deploy to your Mistral workspace (managed deployment)
+
+Push this repo to GitHub, then create a managed deployment pointing at it — Mistral Cloud builds "deploy/docker/Dockerfile.worker" (build context = repo root) and runs the worker with an injected service-account token, so no API key is committed (the image needs mistralai-workflows >= 3.10):
+
+- github_url: "https://github.com/ThomsenDrake/crb-workflow", revision: a commit SHA on "main"
+- deployment name: e.g. "crb-workflow-worker" (reuse the same name to update)
+- Via the Studio console (Workflows → Deployments), the API, or the Mistral MCP "deploy_workflow_deployment" tool
+
+Once the deployment is Active, the workflow "ncaa-d1-best-line" is registered in the workspace and anything that can call Studio — including Vibe Work through the Mistral connector — can start an execution:
 
 ~~~python
 import os
@@ -116,7 +129,7 @@ execution = client.workflows.execute_workflow(
 print(execution.model_dump_json(indent=2))
 ~~~
 
-To run the worker without the CLI: "cd apps/worker && uv sync" then "PYTHONPATH=src uv run python -m worker.entrypoints.worker".
+To ship a new version: push to "main" and redeploy the same deployment name.
 
 ## Input schema ("LineShopperInput")
 
