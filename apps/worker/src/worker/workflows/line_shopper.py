@@ -404,7 +404,17 @@ async def build_report(
             {"role": "user", "content": json.dumps(payload, indent=2)},
         ],
     )
-    return resp.choices[0].message.content
+    content = resp.choices[0].message.content
+    if not isinstance(content, str):
+        # Some models return content as a list of blocks (thinking/text); keep text blocks only.
+        parts = []
+        for block in content or []:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict) and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+        content = chr(10).join(p for p in parts if p)
+    return content
 
 
 @workflows.workflow.define(
