@@ -68,8 +68,44 @@ class GameOdds(BaseModel):
     projection: Projection | None = None
 
 
+class SourceSpec(BaseModel):
+    """One live odds source. The built-in type is "espn" (public ESPN JSON APIs, no key)."""
+
+    type: str = "espn"
+    date: str | None = None  # "YYYY-MM-DD" or "today"; None = today in America/New_York
+    groups: list[int] | None = None  # ESPN conference-group ids; None or [80] = all FBS
+    limit: int = Field(100, ge=1, le=500)  # max games scanned from the slate
+    seasontype: int | None = None  # 1 = preseason, 2 = regular season, 3 = postseason
+    per_book: bool = True  # fetch each sportsbook's own lines via the ESPN core odds API
+    include_in_progress: bool = False  # also ingest games already in progress
+    providers: list[str] | None = None  # keep only these sportsbooks (case-insensitive)
+    timeout_seconds: float = Field(20.0, gt=0)
+    max_concurrency: int = Field(8, ge=1, le=32)
+
+
+class IngestionInfo(BaseModel):
+    """Provenance for a live ingestion step."""
+
+    sources: list[str] = Field(default_factory=list)
+    fetched_at_utc: str = ""
+    events_scanned: int = 0
+    games_with_odds: int = 0
+    books_seen: list[str] = Field(default_factory=list)
+    detail: str = ""
+
+
+class IngestionResult(BaseModel):
+    games: list[GameOdds] = Field(default_factory=list)
+    info: IngestionInfo = Field(default_factory=IngestionInfo)
+
+
 class LineShopperInput(BaseModel):
-    games: list[GameOdds] = Field(..., min_length=1)
+    games: list[GameOdds] | None = Field(
+        None, description="Explicit slate with per-book odds; omit to pull live games from sources"
+    )
+    sources: list[SourceSpec] | None = Field(
+        None, description="Live sources to ingest; default = ESPN FBS slate for today"
+    )
     bankroll: float = Field(1000.0, gt=0)
     kelly_fraction: float = Field(0.25, gt=0, le=1, description="Fraction of full Kelly to stake (0.25 = quarter Kelly)")
     max_stake_pct: float = Field(0.05, gt=0, le=0.25, description="Hard cap on any single bet, as a fraction of bankroll")
@@ -115,6 +151,7 @@ class LineShopperOutput(BaseModel):
     results: list[GameResult]
     report_markdown: str
     disclaimer: str
+    ingestion: IngestionInfo | None = None
 
 
 # --------------------------- LLM structured output ---------------------------

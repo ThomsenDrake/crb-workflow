@@ -3,6 +3,8 @@
 Pipeline — every step is a durable activity, so an execution resumes from the last
 completed step if the worker restarts:
 
+0. ingest_live_odds   (only when input.games is omitted) pull the live FBS slate and
+                      per-sportsbook odds from public sources (ESPN by default)
 1. normalize_odds     American -> decimal odds + implied probabilities, per book/market
 2. compute_consensus  devig every two-way market (power method) and average across books
 3. line_shop          best price (and best number) per market/side across all books
@@ -22,14 +24,18 @@ from mistralai.workflows import Depends
 from mistralai.workflows.client import get_mistral_client
 
 from . import odds_math as om
+from . import sources as live_sources
 from .models import (
     BestLine,
     GameProjection,
     GameProjections,
     GameResult,
+    IngestionInfo,
+    IngestionResult,
     LineShopperInput,
     LineShopperOutput,
     Projection,
+    SourceSpec,
 )
 
 DISCLAIMER = (
@@ -48,6 +54,13 @@ def _side(american: int) -> dict:
         "decimal": round(decimal, 6),
         "implied": round(om.implied_prob(decimal), 6),
     }
+
+
+@workflows.activity(start_to_close_timeout=timedelta(minutes=10))
+async def ingest_live_odds(specs: list[dict]) -> IngestionResult:
+    """Pull the live slate and per-book odds from public sources (ESPN unless configured)."""
+    parsed = [SourceSpec(**s) for s in specs]
+    return await live_sources.ingest(parsed)
 
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=2))
@@ -244,7 +257,7 @@ async def project_games(
             "and short notes. Do not reference betting lines or odds - you do not have them. "
             "Be honest about uncertainty. Return structured output only."
         )
-        user = "Games (JSON):\n" + json.dumps(missing, indent=2)
+        user = "Games (JSON):" + chr(10) + json.dumps(missing, indent=2)
         try:
             resp = await client.chat.parse_async(
                 model=model,
@@ -363,7 +376,7 @@ async def build_report(
         "ONLY the numbers in the provided JSON and never invent figures; for each game show the "
         "best line per market (book, line, American odds), the devigged consensus fair probability, "
         "the model probability, edge, EV per unit staked, and recommended stake; sort picks by edge "
-        "descending; include a short methodology section (line shopping across books, power-method "
+        "descending; include a short methodology section (live line shopping across books, power-method "
         "devig k=2, normal-approximation cover/over probabilities, fractional Kelly with caps) and a "
         "'Risks & guardrails' section; end with the provided disclaimer verbatim. Never promise or "
         "imply guaranteed wins."
@@ -388,15 +401,31 @@ async def build_report(
     workflow_display_name="NCAA D1 Best-Line Finder",
     workflow_description=(
         "Finds the best NCAA Division 1 (FBS) football betting line across point spreads, "
-        "moneylines and over/unders: normalizes multi-book odds, removes the vig for a consensus "
-        "fair price, line-shops the best price/number per market, estimates edge and EV against a "
-        "model projection, sizes stakes with fractional Kelly under hard caps, and returns a "
-        "Markdown report with responsible-gambling guardrails."
+        "moneylines and over/unders. Pulls the live slate and per-book odds from public "
+        "sources (ESPN by default) or accepts an explicit slate, then: normalizes multi-book "
+        "odds, removes the vig for a consensus fair price, line-shops the best price/number "
+        "per market, estimates edge and EV against a model projection, sizes stakes with "
+        "fractional Kelly under hard caps, and returns a Markdown report with "
+        "responsible-gambling guardrails."
     ),
 )
 class NcaaD1BestLineWorkflow:
     @workflows.workflow.entrypoint
     async def run(self, input: LineShopperInput) -> LineShopperOutput:
+        ingestion: IngestionInfo | None = None
+        if input.games:
+            games = input.games
+        else:
+            specs = input.sources or [SourceSpec(type="espn", date="today")]
+            res = await ingest_live_odds([s.model_dump(mode="json") for s in specs])
+            games = res.games
+            ingestion = res.info
+        if not games:
+            raise ValueError(
+                "No games with odds found. Pass an explicit games list, or adjust the source "
+                "spec (date, groups, providers) - ESPN returns an empty slate on off-days."
+            )
+        input = input.model_copy(update={"games": games})
         normalized = await normalize_odds(input)
         consensus = await compute_consensus(normalized)
         best_lines = await line_shop(normalized, consensus)
@@ -419,4 +448,5 @@ class NcaaD1BestLineWorkflow:
             results=results,
             report_markdown=report,
             disclaimer=DISCLAIMER,
+            ingestion=ingestion,
         )
