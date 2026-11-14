@@ -45,6 +45,13 @@ DISCLAIMER = (
     "local laws before placing any bet. If gambling is a problem, call or text 1-800-GAMBLER (US)."
 )
 
+LLM_CALL_TIMEOUT_MS = 9 * 60 * 1000
+
+
+def get_chat_client():
+    """Mistral client whose per-request timeout fits inside the 10-minute LLM activity window."""
+    return get_mistral_client(timeout_ms=LLM_CALL_TIMEOUT_MS)
+
 
 def _side(american: int) -> dict:
     decimal = om.american_to_decimal(american)
@@ -237,7 +244,7 @@ async def line_shop(normalized: list[dict], consensus: list[dict]) -> list[dict]
 async def project_games(
     input: LineShopperInput,
     model: str,
-    client=Depends(get_mistral_client),
+    client=Depends(get_chat_client),
 ) -> list[GameProjection]:
     """Build a projection per game: caller-supplied if present, otherwise LLM-generated."""
     result: dict[str, Projection] = {
@@ -379,7 +386,7 @@ async def build_report(
     input: LineShopperInput,
     results: list[GameResult],
     model: str,
-    client=Depends(get_mistral_client),
+    client=Depends(get_chat_client),
 ) -> str:
     """LLM-written Markdown report; numbers come only from the structured results."""
     system = (
