@@ -349,7 +349,12 @@ async def size_stakes(
             if p["qualifies"] and p["edge"] > 0:
                 f = om.kelly_fraction(p["model_prob"], p["decimal"])
                 stake = round(min(f * kelly_fraction, max_stake_pct) * bankroll, 2)
-            picks.append(BestLine(**{**p, "stake": stake}))
+            q = dict(p)
+            q["american_odds"] = q.pop("american")
+            q["decimal_odds"] = q.pop("decimal")
+            q["implied_prob"] = q.pop("implied")
+            q["stake"] = stake
+            picks.append(BestLine(**q))
         results.append(
             GameResult(
                 game_id=g["game_id"],
