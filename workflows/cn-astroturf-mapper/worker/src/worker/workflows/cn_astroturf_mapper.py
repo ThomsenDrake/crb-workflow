@@ -566,7 +566,17 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
 # ── Workflow ──────────────────────────────────────────────────────────────────
 
 
-@workflows.workflow.define(name="cn-astroturf-mapper")
+@workflows.workflow.define(
+    name="cn-astroturf-mapper",
+    workflow_display_name="CN Astroturf Mapper",
+    workflow_description=(
+        "Maps potential X Community Notes astroturfing / coordinated-rating campaigns "
+        "against given target handles, using only X's public Community Notes dataset plus "
+        "the read-only x.md mirror. Reports coordination clusters of pseudonymous "
+        "participant IDs only - never resolved to accounts. Findings are hypotheses for "
+        "human review, not proof of a campaign."
+    ),
+)
 class CnAstroturfMapper(workflows.InteractiveWorkflow):
     def __init__(self):
         self.steps = {k: "pending" for k in ("resolve_targets", "load_notes", "load_ratings", "detect", "assess")}
@@ -576,8 +586,8 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         return self.steps
 
     @workflows.workflow.entrypoint
-    async def run(self, payload: dict) -> dict:
-        p = AstroturfMapperInput.model_validate(payload)
+    async def run(self, payload: AstroturfMapperInput) -> dict:
+        p = payload
 
         self.steps["resolve_targets"] = "running"
         targets = await resolve_target_handles(p)
