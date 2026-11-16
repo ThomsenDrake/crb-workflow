@@ -93,6 +93,10 @@ Summarize for the user from `result`:
   dockerfile `deploy/docker/Dockerfile.cn-astroturf-mapper`).
 - `FAILED` with an x.md `429` rate-limit message in the logs → the worker needs
   the `X_MD_API_KEY` secret (x.md key, not an X token) or a smaller
-  `max_tweets_per_handle` / fewer handles per run.
-- `FAILED` with missing-data errors → check `CN_DATA_BASE` / `CN_MAX_SHARDS`
-  if X changed the public snapshot layout.
+  `max_tweets_per_handle` / fewer handles per run. x.md `403`/`404`/`5xx` on a
+  single profile only downgrade that handle to a `warning` in
+  `result.targets` — the run still completes.
+- `FAILED` with missing-data errors → the CN public data is served as daily
+  snapshots (`YYYY/MM/DD/<table>/<prefix>-NNNNN.zip` under `CN_DATA_BASE`);
+  check `CN_DATA_BASE` / `CN_LOOKBACK_DAYS` / `CN_MAX_SHARDS` if X changed the
+  layout.
