@@ -63,7 +63,7 @@ pauses on a pending input. Drive the RFC 8628 device-code flow from the client:
   "max_tweets_per_handle": 500,
   "with_replies": false,
   "with_reposts": false,
-  "handle_source": "xmd",  // "xmd" | "grok_x_search" (xAI API) | "grok_cli" (Grok Build CLI headless) | "auto" (x.md + grok fallback)
+  "handle_source": "auto",  // default; "xmd" (x.md only) | "grok_x_search" (xAI API) | "grok_cli" (Grok Build CLI headless)
   "min_notes_for_rater": 3,
   "min_co_rating_overlap": 0.5,
   "min_cluster_size": 5,
@@ -83,6 +83,10 @@ pauses on a pending input. Drive the RFC 8628 device-code flow from the client:
 - "last N days" / "past N weeks" / "N months" → `lookback_days`.
 - "include replies" → `with_replies: true`. Never set `with_reposts: true`
   (reposts are other authors' posts).
+- Default is `handle_source: "auto"` — the run pauses once per container for the
+  grok device-code login (see above), then resolves via x.md and falls back to
+  Grok per handle when x.md downgrades it. "use x.md only / skip grok" →
+  `handle_source: "xmd"`.
 - "use Grok/xAI x search instead of x.md" → `handle_source: "grok_cli"` (Grok
   Build CLI shipped in the worker image; EXPECT the device-code login pause,
   see above) or `"grok_x_search"` (xAI Responses API; needs the `XAI_API_KEY`

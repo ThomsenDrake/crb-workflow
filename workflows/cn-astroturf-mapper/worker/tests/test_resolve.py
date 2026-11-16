@@ -59,3 +59,7 @@ def test_parse_device_login_output_bare_code():
 def test_parse_device_login_output_empty():
     assert _parse_device_login_output("") == {}
     assert _parse_device_login_output("login failed") == {}
+
+
+def test_handle_source_defaults_to_auto():
+    assert AstroturfMapperInput(target_handles=["x"]).handle_source == "auto"

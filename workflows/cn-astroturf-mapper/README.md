@@ -101,7 +101,7 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 | "max_tweets_per_handle" | int | 500 | cap on posts scanned per handle |
 | "with_replies" | bool | false | include the account's replies when resolving posts |
 | "with_reposts" | bool | false | never true — reposts are other authors' posts, not the target's own |
-| "handle_source" | string | "xmd" | "xmd" (x.md only), "grok_x_search" (xAI Responses API x_search only), "grok_cli" (Grok Build CLI headless only), or "auto" (x.md with per-handle Grok fallback on warning) |
+| "handle_source" | string | "auto" | "auto" (default: x.md first, per-handle Grok fallback on warning; one device-login pause per container), "xmd" (x.md only), "grok_x_search" (xAI Responses API x_search only), "grok_cli" (Grok Build CLI headless only) |
 | "min_notes_for_rater" | int | 3 | raters must have rated ≥ this many target notes to enter cluster analysis |
 | "min_co_rating_overlap" | float | 0.5 | Jaccard overlap threshold for linking two raters |
 | "min_cluster_size" | int | 5 | cluster must have ≥ this many raters to be flagged |
