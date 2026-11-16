@@ -2,7 +2,7 @@
 
 Run from the repo root with the Mistral CLI ("mistral dev"), or directly:
 
-    cd apps/worker && uv sync
+    cd workflows/ncaa-d1-best-line/worker && uv sync
     PYTHONPATH=src uv run python -m worker.entrypoints.worker
 """
 import asyncio

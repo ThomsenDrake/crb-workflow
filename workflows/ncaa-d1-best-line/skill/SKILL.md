@@ -2,7 +2,7 @@
 name: |
   ncaa-best-line
 description: |
-  Run the deployed NCAA D1 (FBS) best-line workflow `ncaa-d1-best-line` on the `crb-workflow-worker` Mistral Studio deployment and report the best spread/moneyline/over-under lines with edge, EV, breakeven odds, and Kelly-sized stakes. Projections and the report weigh qualitative team context (injuries, news headlines) pulled live from ESPN. Load this skill whenever the user invokes /ncaa-best-line or asks Vibe to find the best NCAA D1 football betting lines, line-shop college football odds, or run the crb-workflow best-line workflow.
+  Run the deployed NCAA D1 (FBS) best-line workflow `ncaa-d1-best-line` on the `crb-workflow-worker` Mistral Studio deployment and report the best spread/moneyline/over-under lines with edge, EV, breakeven odds, and Kelly-sized stakes. Projections and the report weigh qualitative team context (injuries, news headlines) pulled live from ESPN. Load this skill whenever the user invokes /ncaa-best-line or asks Vibe to find the best NCAA D1 football betting lines, line-shop college football odds, or run the dt-personal-workflows best-line workflow.
 ---
 
 # NCAA D1 Best-Line Runner

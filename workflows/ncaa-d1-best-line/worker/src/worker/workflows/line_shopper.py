@@ -15,6 +15,7 @@ completed step if the worker restarts:
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import statistics
 from datetime import timedelta
@@ -47,11 +48,51 @@ DISCLAIMER = (
 )
 
 LLM_CALL_TIMEOUT_MS = 9 * 60 * 1000
+LLM_MAX_ATTEMPTS = 4
+LLM_RETRY_BASE_DELAY_S = 5.0
+LLM_RETRY_MAX_DELAY_S = 60.0
 
 
 def get_chat_client():
     """Mistral client whose per-request timeout fits inside the 10-minute LLM activity window."""
     return get_mistral_client(timeout_ms=LLM_CALL_TIMEOUT_MS)
+
+
+def _is_retryable_llm_error(exc: BaseException) -> bool:
+    """Retry fast-failing HTTP errors: 429 and all 5xx (the SDK default retry list omits
+    e.g. Cloudflare 520), plus connection errors. Read timeouts are left to the
+    activity-level retry so a hung request can't blow the activity window."""
+    status = getattr(exc, "status_code", None)
+    if status == 429 or (isinstance(status, int) and 500 <= status < 600):
+        return True
+    return isinstance(exc, (ConnectionError, TimeoutError)) and not isinstance(exc, OSError)
+
+
+async def _llm_call_with_retry(call, attempts: int = LLM_MAX_ATTEMPTS):
+    """Await ``call()``, retrying retryable errors with exponential backoff.
+
+    Honors a Retry-After response header (capped) when present. Importing the SDK's
+    RetryConfig here is deliberate: this runs in activity context, whereas a module-level
+    ``mistralai.client`` import would drag httpx2/urllib.request into the workflow sandbox
+    and fail validation (RestrictedWorkflowAccessError).
+    """
+    delay = LLM_RETRY_BASE_DELAY_S
+    for attempt in range(1, attempts + 1):
+        try:
+            return await call()
+        except Exception as exc:
+            if attempt == attempts or not _is_retryable_llm_error(exc):
+                raise
+            retry_after = None
+            raw = getattr(exc, "raw_response", None)
+            headers = getattr(raw, "headers", None)
+            if headers is not None:
+                try:
+                    retry_after = float(headers.get("retry-after"))
+                except (TypeError, ValueError):
+                    retry_after = None
+            await asyncio.sleep(min(retry_after, LLM_RETRY_MAX_DELAY_S) if retry_after else delay)
+            delay = min(delay * 2, LLM_RETRY_MAX_DELAY_S)
 
 
 def _side(american: int) -> dict:
@@ -284,13 +325,15 @@ async def project_games(
         )
         user = "Games (JSON):" + chr(10) + json.dumps(missing, indent=2)
         try:
-            resp = await client.chat.parse_async(
-                model=model,
-                messages=[
-                    {"role": "system", "content": system},
-                    {"role": "user", "content": user},
-                ],
-                response_format=GameProjections,
+            resp = await _llm_call_with_retry(
+                lambda: client.chat.parse_async(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": system},
+                        {"role": "user", "content": user},
+                    ],
+                    response_format=GameProjections,
+                )
             )
             parsed = resp.choices[0].message.parsed
             if parsed is None:
@@ -470,12 +513,14 @@ async def build_report(
         "games": compact_games,
         "disclaimer": DISCLAIMER,
     }
-    resp = await client.chat.complete_async(
-        model=model,
-        messages=[
-            {"role": "system", "content": system},
-            {"role": "user", "content": json.dumps(payload, indent=2)},
-        ],
+    resp = await _llm_call_with_retry(
+        lambda: client.chat.complete_async(
+            model=model,
+            messages=[
+                {"role": "system", "content": system},
+                {"role": "user", "content": json.dumps(payload, indent=2)},
+            ],
+        )
     )
     content = resp.choices[0].message.content
     if not isinstance(content, str):

@@ -2,8 +2,8 @@
 
 Usage:
     export MISTRAL_API_KEY=...
-    python examples/run_execution.py                                  # live ESPN FBS slate (sample_input.json)
-    python examples/run_execution.py examples/sample_input_fixed.json  # fixed example slate
+    python workflows/ncaa-d1-best-line/examples/run_execution.py                                                     # live ESPN FBS slate (sample_input.json)
+    python workflows/ncaa-d1-best-line/examples/run_execution.py workflows/ncaa-d1-best-line/examples/sample_input_fixed.json  # fixed example slate
 """
 import json
 import os

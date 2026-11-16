@@ -40,7 +40,7 @@ try:
     EASTERN = ZoneInfo("America/New_York")
 except Exception:
     EASTERN = timezone(timedelta(hours=-5))  # EST fallback if tzdata is missing
-USER_AGENT = "crb-workflow/0.2 (+https://github.com/ThomsenDrake/crb-workflow)"
+USER_AGENT = "dt-personal-workflows/0.2 (+https://github.com/ThomsenDrake/dt-personal-workflows)"
 
 
 def _espn_date(date: str | None) -> str:
