@@ -1,6 +1,8 @@
 """Unit tests for the pure coordination-detection helpers in cn_astroturf_mapper."""
 from worker.workflows.cn_astroturf_mapper import (
+    AstroturfMapperInput,
     detect_bursts,
+    detect_coordination,
     detect_status_flips,
     find_corating_clusters,
     score_handle,
@@ -61,3 +63,16 @@ def test_score_handle_scales_and_caps():
     score, severity = score_handle(10, [big_cluster, dict(big_cluster)], [{"x": 1}] * 10, [{"y": 1}] * 10)
     assert score == 80.0
     assert severity == "critical"
+
+
+def test_detect_reports_noted_tweet_ids():
+    p = AstroturfMapperInput(target_handles=["h"])
+    targets = [{"handle": "h", "tweet_ids": ["t1", "t2"], "tweets_scanned": 2}]
+    notes = [{"noteId": "n1", "tweetId": "t1", "author_participant_id": "x", "createdAtMillis": 1,
+              "classification": "MISINFORMED_OR_POTENTIALLY_MISLEADING", "summary_excerpt": "s"}]
+    data = {"ratings_by_note": {}, "status_by_note": {}, "total_ratings_kept": 0}
+    import asyncio
+
+    f = asyncio.run(detect_coordination(targets, notes, data, p))
+    assert f["per_handle"]["h"]["noted_tweet_ids"] == ["t1"]
+    assert f["per_handle"]["h"]["notes_on_their_posts"] == 1

@@ -6,6 +6,8 @@ from worker.workflows.cn_astroturf_mapper import (
     AstroturfMapperInput,
     _extract_status_ids,
     _parse_device_login_output,
+    _parse_user_id,
+    _post_cap,
     _resolve_handle_grok_cli,
 )
 
@@ -63,6 +65,20 @@ def test_parse_device_login_output_empty():
 
 def test_handle_source_defaults_to_auto():
     assert AstroturfMapperInput(target_handles=["x"]).handle_source == "auto"
+
+
+def test_history_scope_defaults_to_full_and_caps():
+    p = AstroturfMapperInput(target_handles=["x"])
+    assert p.history_scope == "full"
+    assert _post_cap(p) == p.max_history_posts
+    p2 = AstroturfMapperInput(target_handles=["x"], history_scope="recent")
+    assert _post_cap(p2) == p2.max_tweets_per_handle
+
+
+def test_parse_user_id():
+    assert _parse_user_id("USER_ID: 326756275\nhttps://x.com/a/status/1") == "326756275"
+    assert _parse_user_id("no id here") is None
+    assert _parse_user_id("") is None
 
 
 def test_workflow_init_initializes_interactive_wait_state():
