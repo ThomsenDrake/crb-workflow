@@ -16,9 +16,13 @@ law; attribution requires external data and is out of scope here.
 Pipeline (each step is an @workflows.activity so all side effects are durable
 and retried; the entrypoint stays deterministic):
 
-  1. resolve_target_handles  x.md (https://mdfromx.com/docs): handles -> recent
-                             post IDs via GET /api/v1/profiles/{handle}/posts
-                             (plain GET, no X credentials needed)
+  1. resolve_target_handles  handles -> recent post IDs via x.md
+                             (https://mdfromx.com/docs, GET /api/v1/profiles/{handle}/posts;
+                             plain GET, no X credentials), or — when input handle_source is
+                             "grok_x_search"/"grok_cli"/"auto" — via Grok X Search: the xAI
+                             Responses API x_search tool (XAI_API_KEY; billed per post
+                             fetched) or the Grok Build CLI in headless mode (its own cached
+                             login; headless -p is documented for scripts/CI)
   2. load_target_notes       CN public data: notes attached to those tweets
   3. load_ratings_and_status CN public data: ratings + status history for those
                              notes (streamed + filtered, the ratings table is
@@ -47,6 +51,16 @@ Env vars:
   X_MD_API_KEY    optional x.md API key (Authorization: Bearer). Without it the
                   bulk import is limited to ~3 imports/hour, 5/day per IP; with a
                   key you get your key's import allowance. Never an X token.
+  XAI_API_KEY     optional xAI API key enabling the grok_x_search handle source
+                  (xAI Responses API x_search tool; billed per post fetched — an
+                  xAI meter, not X's pay-per-use API). Never an X token or a
+                  grok.com login.
+  XAI_API_BASE    xAI API base URL (default https://api.x.ai/v1)
+  XAI_XSEARCH_MODEL  model used for x_search calls (default grok-4.7)
+  GROK_BIN        grok binary for the grok_cli source (default "grok" on PATH;
+                  ~/.grok/bin/grok per xAI docs). GROK_HOME may point the CLI at its
+                  credential dir; the cached login (~/.grok/auth.json) is used as-is
+                  and is never read, printed, or logged by this module.
   CN_DATA_BASE      base URL of public CN snapshots
                     (default https://ton.twimg.com/birdwatch-public-data)
   CN_LOOKBACK_DAYS  days to walk back from today to find the latest daily
@@ -55,16 +69,18 @@ Env vars:
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
 import json
 import os
+import re
 import tempfile
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -80,6 +96,7 @@ class AstroturfMapperInput(BaseModel):
     max_tweets_per_handle: int = 500
     with_replies: bool = False   # include the account's replies when resolving posts (via x.md)
     with_reposts: bool = False   # never true: reposts are other people's posts, not targets' own
+    handle_source: Literal["xmd", "grok_x_search", "grok_cli", "auto"] = "xmd"  # xmd = x.md only; grok_x_search = xAI Responses API x_search only; grok_cli = Grok Build CLI headless only; auto = x.md with per-handle grok fallback on warning
     min_notes_for_rater: int = 3          # rater must have rated >= this many target notes to enter cluster analysis
     min_co_rating_overlap: float = 0.5    # Jaccard overlap threshold for linking two raters
     min_cluster_size: int = 5             # cluster must have >= this many raters to be flagged
@@ -105,6 +122,10 @@ class CampaignAssessment(BaseModel):
     overall_summary: str
     per_handle: list[HandleAssessment]
     methodology_caveats: list[str]
+
+
+class GrokDeviceLoginInput(BaseModel):
+    user_code: str = Field(description="The device code you entered at the verification URL (echoed back to confirm you completed the grok login)")
 
 
 # ── Small pure helpers (also used inside activities) ──────────────────────────
@@ -260,71 +281,354 @@ def score_handle(n_notes: int, clusters: list, bursts: list, flips: list) -> tup
 # `tweetId` column. Optional X_MD_API_KEY raises the import rate allowance.
 
 
+XAI_API_BASE = os.environ.get("XAI_API_BASE", "https://api.x.ai/v1")
+XAI_XSEARCH_MODEL = os.environ.get("XAI_XSEARCH_MODEL", "grok-4.7")
+
+_STATUS_URL_RE = re.compile(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]{1,20})/status(?:es)?/(\d+)", re.IGNORECASE)
+
+
+def _extract_status_ids(text: str, handle: Optional[str] = None) -> list[str]:
+    """Numeric tweet IDs from x.com status URLs in `text`, deduped in order, optionally restricted to one handle."""
+    seen = set()
+    out = []
+    for m in _STATUS_URL_RE.finditer(text or ""):
+        if handle and m.group(1).lower() != handle.lower():
+            continue
+        sid = m.group(2)
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+    return out
+
+
+_DEVICE_URL_RE = re.compile(r"https?://[^\s\"']+")
+_DEVICE_CODE_PARAM_RE = re.compile(r"user_code=([A-Za-z0-9-]+)")
+_DEVICE_DASH_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4})\b")
+
+
+def _parse_device_login_output(text: str) -> dict:
+    """Extract the verification URL and user code from `grok login --device-auth` output (RFC 8628)."""
+    text = text or ""
+    out = {}
+    urls = _DEVICE_URL_RE.findall(text)
+    url = (
+        next((u for u in urls if "user_code=" in u), None)
+        or next((u for u in urls if "device" in u or "oauth" in u), None)
+        or (urls[0] if urls else None)
+    )
+    if url:
+        out["verification_url"] = url
+    m = _DEVICE_CODE_PARAM_RE.search(text) or _DEVICE_DASH_CODE_RE.search(text)
+    if m:
+        out["user_code"] = m.group(1)
+    return out
+
+
+async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMapperInput) -> dict:
+    """x.md bulk-history route for one handle (see module docs). Degrades to a per-handle warning on 403/404/5xx."""
+    seen = set()
+    tweet_ids = []
+    until = None
+    body = {}
+    warning = None
+    while len(tweet_ids) < p.max_tweets_per_handle:
+        params = {
+            "since": since,
+            "max_posts": min(5000, p.max_tweets_per_handle - len(tweet_ids) + 1),
+            "format": "json",
+            "with_replies": "true" if p.with_replies else "false",
+            "with_reposts": "false",  # reposts are the ORIGINAL author's post — exclude
+        }
+        if until:
+            params["until"] = until
+        r = await client.get(f"/api/v1/profiles/{handle}/posts", params=params)
+        if r.status_code == 429:
+            raise RuntimeError(
+                f"x.md rate limited on @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
+                "set X_MD_API_KEY for a higher import allowance or reduce max_tweets_per_handle"
+            )
+        if r.status_code in (403, 404):
+            warning = "profile not found or not publicly readable via x.md"
+            break
+        if r.status_code >= 500:
+            # x.md bulk-import occasionally 500s (e.g. very large profiles); degrade per-handle
+            warning = f"x.md returned HTTP {r.status_code} for @{handle}; no posts resolved for this handle"
+            break
+        r.raise_for_status()
+        try:
+            body = r.json()
+        except ValueError:
+            warning = f"x.md returned a non-JSON response for @{handle}; no posts resolved for this handle"
+            break
+        for post in body.get("posts", []):
+            pid = str(post.get("id") or "")
+            if pid and pid not in seen:
+                seen.add(pid)
+                tweet_ids.append(pid)
+        meta = body.get("meta", {})
+        if meta.get("truncated") and meta.get("next_until") and len(tweet_ids) < p.max_tweets_per_handle:
+            until = meta["next_until"]  # continue the walk; dedupe boundary via `seen`
+        else:
+            break
+    entry = {
+        "handle": handle,
+        "user_id": (body.get("profile") or {}).get("id") if body.get("profile") else None,
+        "tweet_ids": tweet_ids[: p.max_tweets_per_handle],
+        "tweets_scanned": len(tweet_ids[: p.max_tweets_per_handle]),
+        "source": "xmd",
+    }
+    if warning:
+        entry["warning"] = warning
+    return entry
+
+
+async def _resolve_handle_grok_x_search(handle: str, since: str, until: str, p: AstroturfMapperInput) -> dict:
+    """Resolve one handle to recent post IDs via xAI's Grok X Search tool.
+
+    Published xAI Responses API route (not a grok.com/X login): x_search scoped with
+    allowed_x_handles + from_date/to_date; the model echoes the x.com post URLs and the
+    numeric tweet IDs are parsed out of them. Billed per post fetched ($5/1k posts as of
+    2026-09, reported in usage.server_side_tool_usage_details) plus tokens — an xAI
+    meter, not X's pay-per-use API.
+    """
+    import httpx
+
+    entry = {"handle": handle, "user_id": None, "tweet_ids": [], "tweets_scanned": 0, "source": "grok_x_search"}
+    api_key = os.environ.get("XAI_API_KEY")
+    if not api_key:
+        entry["warning"] = "XAI_API_KEY not set; grok_x_search source unavailable for this handle"
+        return entry
+    query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
+    prompt = (
+        f"Use X Search only (no web search). List up to {p.max_tweets_per_handle} original posts by "
+        f"@{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the full x.com "
+        "post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first. This is "
+        "read-only: do not post, reply, like, repost, or follow anything. If no posts are found, reply exactly: NONE"
+    )
+    body = {
+        "model": XAI_XSEARCH_MODEL,
+        "input": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "x_search", "allowed_x_handles": [handle], "from_date": since, "to_date": until}],
+        "max_turns": 2,
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        r = await client.post(
+            f"{XAI_API_BASE}/responses",
+            json=body,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+    if r.status_code == 429:
+        raise RuntimeError(
+            f"xAI rate limited on grok x_search for @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
+            "reduce max_tweets_per_handle or check the XAI team rate limits"
+        )
+    if r.status_code in (401, 403):
+        entry["warning"] = "XAI_API_KEY missing or invalid; grok_x_search unavailable for this handle"
+        return entry
+    if r.status_code >= 500:
+        entry["warning"] = f"xAI returned HTTP {r.status_code} for grok x_search on @{handle}"
+        return entry
+    r.raise_for_status()
+    resp = r.json()
+    texts = []
+    for item in resp.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                texts.append(c.get("text") or "")
+                for a in c.get("annotations") or []:
+                    if a.get("url"):
+                        texts.append(a["url"])
+    ids = _extract_status_ids("\n".join(texts), handle)
+    usage = (resp.get("usage") or {}).get("server_side_tool_usage_details") or {}
+    entry["tweet_ids"] = ids[: p.max_tweets_per_handle]
+    entry["tweets_scanned"] = len(entry["tweet_ids"])
+    if usage.get("x_posts_fetched"):
+        entry["x_posts_fetched"] = usage["x_posts_fetched"]
+    if not ids:
+        entry["warning"] = f"grok x_search found no posts for @{handle} in the requested window"
+    return entry
+
+
+async def _resolve_handle_grok_cli(handle: str, since: str, until: str, p: AstroturfMapperInput) -> dict:
+    """Resolve one handle via the Grok Build CLI in headless mode (documented for scripts/CI).
+
+    Runs `grok -p` with a read-only, X-Search-only prompt and parses tweet IDs from the
+    echoed x.com status URLs. Auth is the CLI's own cached login (GROK_HOME /
+    ~/.grok/auth.json) or XAI_API_KEY — this code never reads, prints, or passes
+    credentials. Requires the grok binary (GROK_BIN, default "grok" on PATH).
+    """
+    import shutil
+    import subprocess
+
+    entry = {"handle": handle, "user_id": None, "tweet_ids": [], "tweets_scanned": 0, "source": "grok_cli"}
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    if shutil.which(bin_path) is None and not os.path.exists(bin_path):
+        entry["warning"] = f"grok CLI not found ({bin_path}); grok_cli source unavailable for this handle"
+        return entry
+    query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
+    prompt = (
+        f"Use X Search (x_search) only, skip web search. List up to {p.max_tweets_per_handle} original "
+        f"posts by @{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the "
+        "full x.com post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first. "
+        "This task is read-only: do not post, reply, like, repost, or follow anything. "
+        "If no posts are found, reply exactly: NONE"
+    )
+    cmd = [bin_path, "--no-subagents", "--no-auto-update", "--max-turns", "6", "--reasoning-effort", "low", "-p", prompt]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=tempfile.mkdtemp(),
+            env=os.environ.copy(),
+        )
+    except OSError as e:
+        entry["warning"] = f"grok CLI failed to start for @{handle}: {e}"
+        return entry
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        entry["warning"] = f"grok CLI timed out after 300s on @{handle}"
+        return entry
+    if proc.returncode != 0:
+        tail = err_b.decode(errors="replace")[-300:]
+        entry["warning"] = f"grok CLI exited {proc.returncode} for @{handle} (not signed in? run `grok login --device-code`): {tail}"
+        return entry
+    ids = _extract_status_ids(out_b.decode(errors="replace"), handle)
+    entry["tweet_ids"] = ids[: p.max_tweets_per_handle]
+    entry["tweets_scanned"] = len(entry["tweet_ids"])
+    if not ids:
+        entry["warning"] = f"grok CLI found no posts for @{handle} in the requested window"
+    return entry
+
+
+async def _grok_fallbacks(handle: str, since: str, until: str, p: AstroturfMapperInput) -> list[dict]:
+    """Candidate grok resolvers for handle_source="auto", in order: xAI API if keyed, then the CLI if installed."""
+    import shutil
+
+    out = []
+    if os.environ.get("XAI_API_KEY"):
+        g = await _resolve_handle_grok_x_search(handle, since, until, p)
+        out.append(g)
+        if g.get("tweet_ids"):
+            return out
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    if shutil.which(bin_path) is not None or os.path.exists(bin_path):
+        out.append(await _resolve_handle_grok_cli(handle, since, until, p))
+    return out
+
+
+def _grok_home() -> str:
+    return os.environ.get("GROK_HOME") or os.path.expanduser("~/.grok")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[-1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+@workflows.activity(start_to_close_timeout=timedelta(minutes=2), retry_policy_max_attempts=1)
+async def grok_device_login_start() -> dict:
+    """Start the grok CLI device-code login (RFC 8628) when no credential is present.
+
+    The login process keeps polling in the background and writes the session to
+    GROK_HOME/~/.grok/auth.json. Returns status + the user-facing verification URL and
+    code — never token material (log contents are not returned).
+    """
+    import shutil
+    import subprocess
+
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    if shutil.which(bin_path) is None and not os.path.exists(bin_path):
+        return {"status": "no_binary", "detail": f"grok CLI not found ({bin_path})"}
+    if os.environ.get("XAI_API_KEY"):
+        return {"status": "authenticated", "detail": "XAI_API_KEY set"}
+    if os.path.exists(os.path.join(_grok_home(), "auth.json")):
+        return {"status": "authenticated", "detail": "cached login present"}
+    run_dir = tempfile.mkdtemp(prefix="grok-login-")
+    log_path = os.path.join(run_dir, "login.log")
+    log_f = open(log_path, "wb")
+    proc = subprocess.Popen([bin_path, "login", "--device-auth"], stdout=log_f, stderr=subprocess.STDOUT, env=os.environ.copy(), cwd=run_dir)
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=20)
+    parsed = {}
+    while datetime.now(timezone.utc) < deadline:
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                parsed = _parse_device_login_output(f.read())
+        except OSError:
+            pass
+        if parsed.get("verification_url") and parsed.get("user_code"):
+            return {"status": "pending", "verification_url": parsed["verification_url"], "user_code": parsed["user_code"], "pid": proc.pid}
+        if proc.poll() is not None:
+            break
+        await asyncio.sleep(1)
+    return {"status": "failed", "detail": "grok login exited before printing a verification URL", "pid": proc.pid}
+
+
+@workflows.activity(start_to_close_timeout=timedelta(minutes=12), retry_policy_max_attempts=1)
+async def grok_device_login_wait(pid: int, timeout_seconds: int = 600) -> dict:
+    """Wait for the background device-code login to complete (auth.json present and `grok models` succeeds)."""
+    import shutil
+    import subprocess
+
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    auth_json = os.path.join(_grok_home(), "auth.json")
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+    while datetime.now(timezone.utc) < deadline:
+        if os.path.exists(auth_json) and shutil.which(bin_path) is not None or os.path.exists(bin_path):
+            try:
+                probe = subprocess.run([bin_path, "models"], capture_output=True, timeout=60, env=os.environ.copy())
+                if probe.returncode == 0:
+                    return {"status": "authenticated"}
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not _pid_alive(pid) and not os.path.exists(auth_json):
+            return {"status": "failed", "detail": "grok login process exited before completing"}
+        await asyncio.sleep(5)
+    return {"status": "timeout"}
+
+
 @workflows.activity(start_to_close_timeout=timedelta(minutes=15), retry_policy_max_attempts=3)
 async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     import httpx
 
     since = (datetime.now(timezone.utc) - timedelta(days=p.lookback_days)).strftime("%Y-%m-%d")
+    until = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")  # x_search to_date is exclusive
+    out = []
+    if p.handle_source in ("grok_x_search", "grok_cli"):
+        resolver = _resolve_handle_grok_x_search if p.handle_source == "grok_x_search" else _resolve_handle_grok_cli
+        for raw in p.target_handles:
+            out.append(await resolver(raw.lstrip("@"), since, until, p))
+        return out
     headers = {"Accept": "application/json"}
     api_key = os.environ.get("X_MD_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    out = []
     async with httpx.AsyncClient(base_url="https://mdfromx.com", headers=headers, timeout=300.0) as client:
         for raw in p.target_handles:
             handle = raw.lstrip("@")
-            seen = set()
-            tweet_ids = []
-            until = None
-            body = {}
-            warning = None
-            while len(tweet_ids) < p.max_tweets_per_handle:
-                params = {
-                    "since": since,
-                    "max_posts": min(5000, p.max_tweets_per_handle - len(tweet_ids) + 1),
-                    "format": "json",
-                    "with_replies": "true" if p.with_replies else "false",
-                    "with_reposts": "false",  # reposts are the ORIGINAL author's post — exclude
-                }
-                if until:
-                    params["until"] = until
-                r = await client.get(f"/api/v1/profiles/{handle}/posts", params=params)
-                if r.status_code == 429:
-                    raise RuntimeError(
-                        f"x.md rate limited on @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
-                        "set X_MD_API_KEY for a higher import allowance or reduce max_tweets_per_handle"
-                    )
-                if r.status_code in (403, 404):
-                    warning = "profile not found or not publicly readable via x.md"
-                    break
-                if r.status_code >= 500:
-                    # x.md bulk-import occasionally 500s (e.g. very large profiles); degrade per-handle
-                    warning = f"x.md returned HTTP {r.status_code} for @{handle}; no posts resolved for this handle"
-                    break
-                r.raise_for_status()
-                try:
-                    body = r.json()
-                except ValueError:
-                    warning = f"x.md returned a non-JSON response for @{handle}; no posts resolved for this handle"
-                    break
-                for post in body.get("posts", []):
-                    pid = str(post.get("id") or "")
-                    if pid and pid not in seen:
-                        seen.add(pid)
-                        tweet_ids.append(pid)
-                meta = body.get("meta", {})
-                if meta.get("truncated") and meta.get("next_until") and len(tweet_ids) < p.max_tweets_per_handle:
-                    until = meta["next_until"]  # continue the walk; dedupe boundary via `seen`
-                else:
-                    break
-            entry = {
-                "handle": handle,
-                "user_id": (body.get("profile") or {}).get("id") if body.get("profile") else None,
-                "tweet_ids": tweet_ids[: p.max_tweets_per_handle],
-                "tweets_scanned": len(tweet_ids[: p.max_tweets_per_handle]),
-            }
-            if warning:
-                entry["warning"] = warning
+            entry = await _resolve_handle_xmd(client, handle, since, p)
+            if p.handle_source == "auto" and entry.get("warning"):
+                note = entry["warning"]
+                for g in await _grok_fallbacks(handle, since, until, p):
+                    if g.get("tweet_ids"):
+                        entry["tweet_ids"] = g["tweet_ids"]
+                        entry["tweets_scanned"] = g["tweets_scanned"]
+                        entry["source"] = f"auto:xmd-warning+{g['source']}"
+                        entry["warning"] = f"x.md: {note}; recovered via {g['source']}"
+                        if g.get("x_posts_fetched"):
+                            entry["x_posts_fetched"] = g["x_posts_fetched"]
+                        break
+                    if g.get("warning"):
+                        note = f"{note}; {g['source']}: {g['warning']}"
+                entry["warning"] = note
             out.append(entry)
     return out
 
@@ -624,14 +928,34 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
 class CnAstroturfMapper(workflows.InteractiveWorkflow):
     def __init__(self):
         self.steps = {k: "pending" for k in ("resolve_targets", "load_notes", "load_ratings", "detect", "assess")}
+        self.grok_auth: Optional[dict] = None
 
     @workflows.workflow.query(name="get_steps")
     def get_steps(self) -> dict:
         return self.steps
 
+    @workflows.workflow.query(name="get_grok_auth")
+    def get_grok_auth(self) -> Optional[dict]:
+        return self.grok_auth
+
     @workflows.workflow.entrypoint
     async def run(self, payload: AstroturfMapperInput) -> dict:
         p = payload
+
+        grok_auth = None
+        if p.handle_source in ("grok_cli", "auto"):
+            start = await grok_device_login_start()
+            if start.get("status") == "pending":
+                label = f"grok device login: open {start['verification_url']} and enter code {start['user_code']}"
+                try:
+                    submission = await self.wait_for_input(GrokDeviceLoginInput, label=label, timeout=timedelta(minutes=10))
+                    wait = await grok_device_login_wait(start["pid"])
+                    grok_auth = {**start, "status": wait["status"], "submitted_user_code": submission.user_code}
+                except asyncio.TimeoutError:
+                    grok_auth = {**start, "status": "input_timeout"}
+            else:
+                grok_auth = start
+            self.grok_auth = grok_auth
 
         self.steps["resolve_targets"] = "running"
         targets = await resolve_target_handles(p)
@@ -663,6 +987,7 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         return {
             "workflow": "cn-astroturf-mapper",
             "params": p.model_dump(),
+            "grok_auth": grok_auth,
             "targets": targets,
             "total_ratings_kept": data.get("total_ratings_kept", 0),
             "findings": findings,
