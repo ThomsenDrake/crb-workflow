@@ -7,6 +7,7 @@ Monorepo for my personal [Mistral Workflows](https://docs.mistral.ai/studio/work
 | Package | Workflow identifier | Deployment | Description |
 | --- | --- | --- | --- |
 | [workflows/ncaa-d1-best-line](workflows/ncaa-d1-best-line/README.md) | `ncaa-d1-best-line` | `crb-workflow-worker` | NCAA D1 (FBS) best-line finder: live ESPN odds ingestion, line shopping across books, edge/EV vs model projections, fractional-Kelly staking, Markdown report |
+| [workflows/cn-astroturf-mapper](workflows/cn-astroturf-mapper/README.md) | `cn-astroturf-mapper` | `cn-astroturf-mapper-worker` | Maps potential X Community Notes astroturfing / coordinated-rating campaigns against given target handles — public CN dataset + x.md, pseudonymous participant IDs only |
 
 ## Layout
 

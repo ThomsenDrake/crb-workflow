@@ -1,0 +1,20 @@
+[project]
+name = "cn-astroturf-mapper-worker"
+version = "0.1.0"
+description = "Mistral Workflows worker for the X Community Notes astroturf mapper (public CN dataset + x.md; pseudonymous participant IDs only, never resolved to handles)"
+requires-python = ">=3.12"
+dependencies = [
+    "mistralai-workflows[mistralai]>=3.10.0",
+    "pydantic>=2.7.0",
+    "httpx>=0.27.0",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0"]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/worker"]
