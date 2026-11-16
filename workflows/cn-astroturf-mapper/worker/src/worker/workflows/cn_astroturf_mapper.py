@@ -18,9 +18,11 @@ and retried; the entrypoint stays deterministic):
 
   1. resolve_target_handles  handles -> recent post IDs via x.md
                              (https://mdfromx.com/docs, GET /api/v1/profiles/{handle}/posts;
-                             plain GET, no X credentials) or, when input handle_source is
-                             "grok_x_search"/"auto", via xAI's Grok X Search tool
-                             (published xAI Responses API, XAI_API_KEY; billed per post fetched)
+                             plain GET, no X credentials), or — when input handle_source is
+                             "grok_x_search"/"grok_cli"/"auto" — via Grok X Search: the xAI
+                             Responses API x_search tool (XAI_API_KEY; billed per post
+                             fetched) or the Grok Build CLI in headless mode (its own cached
+                             login; headless -p is documented for scripts/CI)
   2. load_target_notes       CN public data: notes attached to those tweets
   3. load_ratings_and_status CN public data: ratings + status history for those
                              notes (streamed + filtered, the ratings table is
@@ -55,6 +57,10 @@ Env vars:
                   grok.com login.
   XAI_API_BASE    xAI API base URL (default https://api.x.ai/v1)
   XAI_XSEARCH_MODEL  model used for x_search calls (default grok-4.7)
+  GROK_BIN        grok binary for the grok_cli source (default "grok" on PATH;
+                  ~/.grok/bin/grok per xAI docs). GROK_HOME may point the CLI at its
+                  credential dir; the cached login (~/.grok/auth.json) is used as-is
+                  and is never read, printed, or logged by this module.
   CN_DATA_BASE      base URL of public CN snapshots
                     (default https://ton.twimg.com/birdwatch-public-data)
   CN_LOOKBACK_DAYS  days to walk back from today to find the latest daily
@@ -63,6 +69,7 @@ Env vars:
 """
 from __future__ import annotations
 
+import asyncio
 import csv
 import hashlib
 import io
@@ -89,7 +96,7 @@ class AstroturfMapperInput(BaseModel):
     max_tweets_per_handle: int = 500
     with_replies: bool = False   # include the account's replies when resolving posts (via x.md)
     with_reposts: bool = False   # never true: reposts are other people's posts, not targets' own
-    handle_source: Literal["xmd", "grok_x_search", "auto"] = "xmd"  # xmd = x.md only; grok_x_search = xAI Grok x_search only; auto = x.md with per-handle grok fallback on warning
+    handle_source: Literal["xmd", "grok_x_search", "grok_cli", "auto"] = "xmd"  # xmd = x.md only; grok_x_search = xAI Responses API x_search only; grok_cli = Grok Build CLI headless only; auto = x.md with per-handle grok fallback on warning
     min_notes_for_rater: int = 3          # rater must have rated >= this many target notes to enter cluster analysis
     min_co_rating_overlap: float = 0.5    # Jaccard overlap threshold for linking two raters
     min_cluster_size: int = 5             # cluster must have >= this many raters to be flagged
@@ -418,6 +425,76 @@ async def _resolve_handle_grok_x_search(handle: str, since: str, until: str, p: 
     return entry
 
 
+async def _resolve_handle_grok_cli(handle: str, since: str, until: str, p: AstroturfMapperInput) -> dict:
+    """Resolve one handle via the Grok Build CLI in headless mode (documented for scripts/CI).
+
+    Runs `grok -p` with a read-only, X-Search-only prompt and parses tweet IDs from the
+    echoed x.com status URLs. Auth is the CLI's own cached login (GROK_HOME /
+    ~/.grok/auth.json) or XAI_API_KEY — this code never reads, prints, or passes
+    credentials. Requires the grok binary (GROK_BIN, default "grok" on PATH).
+    """
+    import shutil
+    import subprocess
+
+    entry = {"handle": handle, "user_id": None, "tweet_ids": [], "tweets_scanned": 0, "source": "grok_cli"}
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    if shutil.which(bin_path) is None and not os.path.exists(bin_path):
+        entry["warning"] = f"grok CLI not found ({bin_path}); grok_cli source unavailable for this handle"
+        return entry
+    query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
+    prompt = (
+        f"Use X Search (x_search) only, skip web search. List up to {p.max_tweets_per_handle} original "
+        f"posts by @{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the "
+        "full x.com post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first. "
+        "This task is read-only: do not post, reply, like, repost, or follow anything. "
+        "If no posts are found, reply exactly: NONE"
+    )
+    cmd = [bin_path, "--no-subagents", "--no-auto-update", "--max-turns", "6", "--reasoning-effort", "low", "-p", prompt]
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            cwd=tempfile.mkdtemp(),
+            env=os.environ.copy(),
+        )
+    except OSError as e:
+        entry["warning"] = f"grok CLI failed to start for @{handle}: {e}"
+        return entry
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=300)
+    except asyncio.TimeoutError:
+        proc.kill()
+        entry["warning"] = f"grok CLI timed out after 300s on @{handle}"
+        return entry
+    if proc.returncode != 0:
+        tail = err_b.decode(errors="replace")[-300:]
+        entry["warning"] = f"grok CLI exited {proc.returncode} for @{handle} (not signed in? run `grok login --device-code`): {tail}"
+        return entry
+    ids = _extract_status_ids(out_b.decode(errors="replace"), handle)
+    entry["tweet_ids"] = ids[: p.max_tweets_per_handle]
+    entry["tweets_scanned"] = len(entry["tweet_ids"])
+    if not ids:
+        entry["warning"] = f"grok CLI found no posts for @{handle} in the requested window"
+    return entry
+
+
+async def _grok_fallbacks(handle: str, since: str, until: str, p: AstroturfMapperInput) -> list[dict]:
+    """Candidate grok resolvers for handle_source="auto", in order: xAI API if keyed, then the CLI if installed."""
+    import shutil
+
+    out = []
+    if os.environ.get("XAI_API_KEY"):
+        g = await _resolve_handle_grok_x_search(handle, since, until, p)
+        out.append(g)
+        if g.get("tweet_ids"):
+            return out
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    if shutil.which(bin_path) is not None or os.path.exists(bin_path):
+        out.append(await _resolve_handle_grok_cli(handle, since, until, p))
+    return out
+
+
 @workflows.activity(start_to_close_timeout=timedelta(minutes=15), retry_policy_max_attempts=3)
 async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     import httpx
@@ -425,9 +502,10 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     since = (datetime.now(timezone.utc) - timedelta(days=p.lookback_days)).strftime("%Y-%m-%d")
     until = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")  # x_search to_date is exclusive
     out = []
-    if p.handle_source == "grok_x_search":
+    if p.handle_source in ("grok_x_search", "grok_cli"):
+        resolver = _resolve_handle_grok_x_search if p.handle_source == "grok_x_search" else _resolve_handle_grok_cli
         for raw in p.target_handles:
-            out.append(await _resolve_handle_grok_x_search(raw.lstrip("@"), since, until, p))
+            out.append(await resolver(raw.lstrip("@"), since, until, p))
         return out
     headers = {"Accept": "application/json"}
     api_key = os.environ.get("X_MD_API_KEY")
@@ -438,16 +516,19 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
             handle = raw.lstrip("@")
             entry = await _resolve_handle_xmd(client, handle, since, p)
             if p.handle_source == "auto" and entry.get("warning"):
-                g = await _resolve_handle_grok_x_search(handle, since, until, p)
-                if g.get("tweet_ids"):
-                    entry["tweet_ids"] = g["tweet_ids"]
-                    entry["tweets_scanned"] = g["tweets_scanned"]
-                    entry["source"] = "auto:xmd-warning+grok_x_search"
-                    entry["warning"] = f"x.md: {entry['warning']}; recovered via grok x_search"
-                    if g.get("x_posts_fetched"):
-                        entry["x_posts_fetched"] = g["x_posts_fetched"]
-                elif g.get("warning"):
-                    entry["warning"] = f"x.md: {entry['warning']}; grok x_search: {g['warning']}"
+                note = entry["warning"]
+                for g in await _grok_fallbacks(handle, since, until, p):
+                    if g.get("tweet_ids"):
+                        entry["tweet_ids"] = g["tweet_ids"]
+                        entry["tweets_scanned"] = g["tweets_scanned"]
+                        entry["source"] = f"auto:xmd-warning+{g['source']}"
+                        entry["warning"] = f"x.md: {note}; recovered via {g['source']}"
+                        if g.get("x_posts_fetched"):
+                            entry["x_posts_fetched"] = g["x_posts_fetched"]
+                        break
+                    if g.get("warning"):
+                        note = f"{note}; {g['source']}: {g['warning']}"
+                entry["warning"] = note
             out.append(entry)
     return out
 

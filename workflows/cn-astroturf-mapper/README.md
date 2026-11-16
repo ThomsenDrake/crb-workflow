@@ -24,7 +24,9 @@ All steps are `@workflows.activity()` functions (durable + retried, so an execut
 ## Data sources
 
 - **x.md** (`https://mdfromx.com/docs`) — keyless read-only mirror of public X content. Bulk history route: `GET https://mdfromx.com/api/v1/profiles/{handle}/posts?since=YYYY-MM-DD&max_posts=N&format=json&with_replies=..&with_reposts=false`. Each post's `id` is the numeric tweet ID — exactly what joins to the CN dataset's `tweetId`. `meta.truncated` / `meta.next_until` paginate the walk; 429s fail with an actionable error, while 403/404/5xx responses only downgrade that handle to a per-handle `warning` so one bad profile doesn't sink the whole run. An optional `X_MD_API_KEY` (sent as `Authorization: Bearer`) raises the import allowance (without a key: ~3 imports/hour, 5/day per IP). It is **not** an X API token.
-- **xAI Grok X Search (optional handle source)** — used when `handle_source` is `"grok_x_search"` (only) or `"auto"` (x.md first, per-handle x_search fallback when x.md downgrades that handle to a warning). Calls the published xAI Responses API `POST https://api.x.ai/v1/responses` with the `x_search` tool scoped by `allowed_x_handles` + `from_date`/`to_date` (`XAI_API_KEY`, model `XAI_XSEARCH_MODEL`, default `grok-4.7`); the model echoes the x.com post URLs and the numeric tweet IDs are parsed from them. Billed per post fetched ($5/1k posts as of 2026-09, surfaced as `x_posts_fetched` on the target entry) plus tokens — an xAI meter, **not** X's pay-per-use API, and never a grok.com/X login. xAI 429 fails the run with an actionable message; 401/403/5xx or a missing key only downgrade that handle to a `warning`.
+- **xAI Grok X Search (optional handle sources)** — used when `handle_source` is `"grok_x_search"` / `"grok_cli"` (only) or `"auto"` (x.md first, per-handle Grok fallback when x.md downgrades that handle to a warning). Two routes to the same `x_search` capability, both on xAI's side of the xAI–X partnership (X's own ToS "published interfaces" clause governs X's services, e.g. the private GraphQL API — not xAI's):
+  - `"grok_x_search"` — the published xAI Responses API: `POST https://api.x.ai/v1/responses` with the `x_search` tool scoped by `allowed_x_handles` + `from_date`/`to_date` (`XAI_API_KEY`, model `XAI_XSEARCH_MODEL`, default `grok-4.7`). Billed per post fetched ($5/1k posts as of 2026-09, surfaced as `x_posts_fetched`) plus tokens — an xAI meter, **not** X's pay-per-use API. xAI 429 fails the run with an actionable message; 401/403/5xx or a missing key only downgrade that handle to a `warning`.
+  - `"grok_cli"` — the Grok Build CLI in headless mode (`grok -p …`, documented by xAI for scripts/CI), using the CLI's own cached login (`GROK_HOME`/`~/.grok/auth.json`, e.g. from `grok login --device-code`) or `XAI_API_KEY`. Draws on the Grok subscription pool rather than per-post API billing; the workflow never reads, prints, or passes those credentials (`GROK_BIN` locates the binary). Note xAI's Acceptable Use Policy bans *unauthorized* automated access — keep runs scoped and low-volume; xAI's docs pair CI/headless automation with `XAI_API_KEY`.
 - **X public Community Notes dataset** — zipped TSV shards under `CN_DATA_BASE` (default `https://ton.twimg.com/birdwatch-public-data`), organized as **daily snapshots**: `YYYY/MM/DD/notes/notes-NNNNN.zip`, `YYYY/MM/DD/noteRatings/ratings-NNNNN.zip` (~184M rows total — always streamed to a temp file and filtered by note ID, never loaded wholesale), and `YYYY/MM/DD/noteStatusHistory/noteStatusHistory-NNNNN.zip`. The worker walks back up to `CN_LOOKBACK_DAYS` (default 7) days from today to find the latest snapshot; `CN_MAX_SHARDS` caps how many shard indexes are probed per table (default 64). If nothing responds, that table is treated as empty instead of failing the run.
 
 ## Detection signals
@@ -69,6 +71,7 @@ Create a managed deployment pointing at this repo — Mistral Cloud builds "depl
 - dockerfile path: "deploy/docker/Dockerfile.cn-astroturf-mapper"
 - secret: "X_MD_API_KEY" (optional; an x.md key, not an X token) — without it you are limited to ~3 imports/hour per IP
 - secret: "XAI_API_KEY" (optional; an xAI API key enabling `handle_source` "grok_x_search"/"auto" — never an X token or grok.com login)
+- for `handle_source` "grok_cli": install the grok CLI in the image (`GROK_BIN`) and provide its cached login via `GROK_HOME`/a secret volume — the workflow itself never handles the token file
 - Via the Studio console (Workflows → Deployments), the API, or the Mistral MCP "deploy_workflow_deployment" tool
 
 Once Active, trigger an execution (this is also what the Vibe skill does):
@@ -97,7 +100,7 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 | "max_tweets_per_handle" | int | 500 | cap on posts scanned per handle |
 | "with_replies" | bool | false | include the account's replies when resolving posts |
 | "with_reposts" | bool | false | never true — reposts are other authors' posts, not the target's own |
-| "handle_source" | string | "xmd" | "xmd" (x.md only), "grok_x_search" (xAI Grok x_search only), or "auto" (x.md with per-handle Grok fallback on warning) |
+| "handle_source" | string | "xmd" | "xmd" (x.md only), "grok_x_search" (xAI Responses API x_search only), "grok_cli" (Grok Build CLI headless only), or "auto" (x.md with per-handle Grok fallback on warning) |
 | "min_notes_for_rater" | int | 3 | raters must have rated ≥ this many target notes to enter cluster analysis |
 | "min_co_rating_overlap" | float | 0.5 | Jaccard overlap threshold for linking two raters |
 | "min_cluster_size" | int | 5 | cluster must have ≥ this many raters to be flagged |
@@ -110,7 +113,7 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 ## Output schema
 
 - "workflow", "params" (echoed input)
-- "targets": per handle — resolved user id (if the source returned one), tweet IDs scanned, `source` ("xmd" / "grok_x_search" / "auto:..."), optional `x_posts_fetched` (xAI usage), warnings (e.g. unreadable profile)
+- "targets": per handle — resolved user id (if the source returned one), tweet IDs scanned, `source` ("xmd" / "grok_x_search" / "grok_cli" / "auto:..."), optional `x_posts_fetched` (xAI usage), warnings (e.g. unreadable profile)
 - "total_ratings_kept": ratings rows kept after filtering to target notes
 - "findings": "per_handle" (notes_on_their_posts, clusters with pseudonymous member IDs, bursts, status_flips, coordination_score, severity), "all_clusters", "notes" (with author_participant_id — pseudonymous only)
 - "llm_assessment": overall_summary, per-handle verdicts (targeted, severity, evidence, recommended_actions), methodology_caveats
@@ -123,11 +126,12 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 - Ratings shards are streamed to a temp file and filtered — the ~184M-row table is never held in memory
 - 429s from x.md fail with an actionable message (set X_MD_API_KEY or lower max_tweets_per_handle); 403/404/5xx from x.md only downgrade that handle to a `warning` in the result
 - handle_source "grok_x_search": xAI 429 fails with an actionable message; 401/403/5xx or a missing XAI_API_KEY only downgrade that handle to a `warning`; the xAI fetch count is reported per handle as `x_posts_fetched`
+- handle_source "grok_cli": missing binary, non-zero exit, or 300s timeout only downgrade that handle to a `warning`; the CLI's credentials are never read or logged by the workflow
 - Reposts are always excluded from target post resolution
 - Findings are framed as hypotheses; organic partisan brigading is a known false-positive source and is called out in the caveats
 
 ## Extending
 
 - **More signals:** add a detector inside "detect_coordination" (e.g. note-creation velocity, cross-target cluster spread) and fold it into "score_handle"
-- **Other handle sources:** add a resolver next to `_resolve_handle_xmd` / `_resolve_handle_grok_x_search` and wire it into "resolve_target_handles" via `handle_source`
+- **Other handle sources:** add a resolver next to `_resolve_handle_xmd` / `_resolve_handle_grok_x_search` / `_resolve_handle_grok_cli` and wire it into "resolve_target_handles" via `handle_source`
 - **Reporting:** extend "_render_markdown" or swap the LLM schema ("CampaignAssessment")

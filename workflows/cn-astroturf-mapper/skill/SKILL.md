@@ -41,7 +41,7 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
   "max_tweets_per_handle": 500,
   "with_replies": false,
   "with_reposts": false,
-  "handle_source": "xmd",
+  "handle_source": "xmd",  // "xmd" | "grok_x_search" (xAI API) | "grok_cli" (Grok Build CLI headless) | "auto" (x.md + grok fallback)
   "min_notes_for_rater": 3,
   "min_co_rating_overlap": 0.5,
   "min_cluster_size": 5,
@@ -61,8 +61,10 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
 - "last N days" / "past N weeks" / "N months" → `lookback_days`.
 - "include replies" → `with_replies: true`. Never set `with_reposts: true`
   (reposts are other authors' posts).
-- "use Grok/xAI x search instead of x.md" → `handle_source: "grok_x_search"`;
-  "fall back to it when x.md fails" → `handle_source: "auto"`.
+- "use Grok/xAI x search instead of x.md" → `handle_source: "grok_x_search"`
+  (xAI Responses API, needs the `XAI_API_KEY` secret) or `"grok_cli"` (Grok
+  Build CLI headless `grok -p`, needs the CLI installed + its cached login);
+  "fall back to Grok when x.md fails" → `handle_source: "auto"`.
 - "more/less sensitive" → lower/raise `min_cluster_size` and
   `min_co_rating_overlap`; "faster/slower burst" → `burst_window_minutes` /
   `burst_min_ratings`.
@@ -112,3 +114,8 @@ Summarize for the user from `result`:
 - `FAILED` with an xAI `429` rate-limit message → lower `max_tweets_per_handle`
   or check the xAI team rate limits. x_search is billed per post fetched
   ($5/1k posts), reported per handle as `x_posts_fetched`.
+- `warning` containing "grok CLI not found" / "grok CLI exited" (with
+  `handle_source` "grok_cli"/"auto") → the worker image needs the grok binary
+  (`GROK_BIN`) and its cached login (`GROK_HOME` / `~/.grok/auth.json` from
+  `grok login --device-code`, supplied as a secret — the workflow never reads
+  or logs the token file).
