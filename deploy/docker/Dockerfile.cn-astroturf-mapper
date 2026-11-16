@@ -8,5 +8,14 @@ WORKDIR /app
 COPY workflows/cn-astroturf-mapper/worker/pyproject.toml ./pyproject.toml
 COPY workflows/cn-astroturf-mapper/worker/src ./src
 RUN pip install --no-cache-dir .
+# Grok Build CLI, for handle_source "grok_cli": installed from the official npm
+# package (avoids the x.ai shell-installer host in the build). No credential is
+# baked in — the login happens at runtime through the workflow's interactive
+# device-code prompt, which writes GROK_HOME/auth.json into the container.
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm ca-certificates \
+    && npm install -g @xai-official/grok \
+    && rm -rf /var/lib/apt/lists/*
+ENV GROK_BIN=grok
+ENV GROK_HOME=/root/.grok
 ENV PYTHONPATH=/app/src
 CMD ["python", "-m", "worker.entrypoints.worker"]
