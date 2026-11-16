@@ -31,6 +31,17 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
    `status` is `COMPLETED` or `FAILED` (use `read_workflow_execution_events`
    with `wait_seconds` between polls for progress; on `FAILED`, read
    `get_workflow_execution_logs` and report the failure, then stop).
+3. If the input used `handle_source` "grok_cli"/"auto" and the worker has no
+   cached grok login, the run pauses on a pending input. Drive the device-code
+   login (RFC 8628) from the client:
+   - `query_workflow_execution` with `query_name` `__get_pending_inputs` (or
+     `get_grok_auth`) — find the pending task whose `label` starts with
+     "grok device login: open <url> and enter code <code>".
+   - Tell the user to open that URL and enter the code, then submit:
+     `update_workflow_execution` with `update_name` `__submit_input` and
+     `input` `{"task_id": <task_id>, "input": {"user_code": "<code>"}}`.
+   - Then poll `get_grok_auth` until `status` is "authenticated" (or the run
+     finishes with a per-handle `warning` if login timed out).
 
 ## Input
 

@@ -124,6 +124,10 @@ class CampaignAssessment(BaseModel):
     methodology_caveats: list[str]
 
 
+class GrokDeviceLoginInput(BaseModel):
+    user_code: str = Field(description="The device code you entered at the verification URL (echoed back to confirm you completed the grok login)")
+
+
 # ── Small pure helpers (also used inside activities) ──────────────────────────
 
 HELPFUL_VALUES = {"HELPFUL", "SOMEWHAT_HELPFUL"}
@@ -294,6 +298,29 @@ def _extract_status_ids(text: str, handle: Optional[str] = None) -> list[str]:
         if sid not in seen:
             seen.add(sid)
             out.append(sid)
+    return out
+
+
+_DEVICE_URL_RE = re.compile(r"https?://[^\s\"']+")
+_DEVICE_CODE_PARAM_RE = re.compile(r"user_code=([A-Za-z0-9-]+)")
+_DEVICE_DASH_CODE_RE = re.compile(r"\b([A-Z0-9]{4}-[A-Z0-9]{4})\b")
+
+
+def _parse_device_login_output(text: str) -> dict:
+    """Extract the verification URL and user code from `grok login --device-auth` output (RFC 8628)."""
+    text = text or ""
+    out = {}
+    urls = _DEVICE_URL_RE.findall(text)
+    url = (
+        next((u for u in urls if "user_code=" in u), None)
+        or next((u for u in urls if "device" in u or "oauth" in u), None)
+        or (urls[0] if urls else None)
+    )
+    if url:
+        out["verification_url"] = url
+    m = _DEVICE_CODE_PARAM_RE.search(text) or _DEVICE_DASH_CODE_RE.search(text)
+    if m:
+        out["user_code"] = m.group(1)
     return out
 
 
@@ -493,6 +520,79 @@ async def _grok_fallbacks(handle: str, since: str, until: str, p: AstroturfMappe
     if shutil.which(bin_path) is not None or os.path.exists(bin_path):
         out.append(await _resolve_handle_grok_cli(handle, since, until, p))
     return out
+
+
+def _grok_home() -> str:
+    return os.environ.get("GROK_HOME") or os.path.expanduser("~/.grok")
+
+
+def _pid_alive(pid: int) -> bool:
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return f.read().rsplit(")", 1)[-1].split()[0] != "Z"
+    except OSError:
+        return False
+
+
+@workflows.activity(start_to_close_timeout=timedelta(minutes=2), retry_policy_max_attempts=1)
+async def grok_device_login_start() -> dict:
+    """Start the grok CLI device-code login (RFC 8628) when no credential is present.
+
+    The login process keeps polling in the background and writes the session to
+    GROK_HOME/~/.grok/auth.json. Returns status + the user-facing verification URL and
+    code — never token material (log contents are not returned).
+    """
+    import shutil
+    import subprocess
+
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    if shutil.which(bin_path) is None and not os.path.exists(bin_path):
+        return {"status": "no_binary", "detail": f"grok CLI not found ({bin_path})"}
+    if os.environ.get("XAI_API_KEY"):
+        return {"status": "authenticated", "detail": "XAI_API_KEY set"}
+    if os.path.exists(os.path.join(_grok_home(), "auth.json")):
+        return {"status": "authenticated", "detail": "cached login present"}
+    run_dir = tempfile.mkdtemp(prefix="grok-login-")
+    log_path = os.path.join(run_dir, "login.log")
+    log_f = open(log_path, "wb")
+    proc = subprocess.Popen([bin_path, "login", "--device-auth"], stdout=log_f, stderr=subprocess.STDOUT, env=os.environ.copy(), cwd=run_dir)
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=20)
+    parsed = {}
+    while datetime.now(timezone.utc) < deadline:
+        try:
+            with open(log_path, "r", errors="replace") as f:
+                parsed = _parse_device_login_output(f.read())
+        except OSError:
+            pass
+        if parsed.get("verification_url") and parsed.get("user_code"):
+            return {"status": "pending", "verification_url": parsed["verification_url"], "user_code": parsed["user_code"], "pid": proc.pid}
+        if proc.poll() is not None:
+            break
+        await asyncio.sleep(1)
+    return {"status": "failed", "detail": "grok login exited before printing a verification URL", "pid": proc.pid}
+
+
+@workflows.activity(start_to_close_timeout=timedelta(minutes=12), retry_policy_max_attempts=1)
+async def grok_device_login_wait(pid: int, timeout_seconds: int = 600) -> dict:
+    """Wait for the background device-code login to complete (auth.json present and `grok models` succeeds)."""
+    import shutil
+    import subprocess
+
+    bin_path = os.environ.get("GROK_BIN", "grok")
+    auth_json = os.path.join(_grok_home(), "auth.json")
+    deadline = datetime.now(timezone.utc) + timedelta(seconds=timeout_seconds)
+    while datetime.now(timezone.utc) < deadline:
+        if os.path.exists(auth_json) and shutil.which(bin_path) is not None or os.path.exists(bin_path):
+            try:
+                probe = subprocess.run([bin_path, "models"], capture_output=True, timeout=60, env=os.environ.copy())
+                if probe.returncode == 0:
+                    return {"status": "authenticated"}
+            except (OSError, subprocess.TimeoutExpired):
+                pass
+        if not _pid_alive(pid) and not os.path.exists(auth_json):
+            return {"status": "failed", "detail": "grok login process exited before completing"}
+        await asyncio.sleep(5)
+    return {"status": "timeout"}
 
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=15), retry_policy_max_attempts=3)
@@ -828,14 +928,34 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
 class CnAstroturfMapper(workflows.InteractiveWorkflow):
     def __init__(self):
         self.steps = {k: "pending" for k in ("resolve_targets", "load_notes", "load_ratings", "detect", "assess")}
+        self.grok_auth: Optional[dict] = None
 
     @workflows.workflow.query(name="get_steps")
     def get_steps(self) -> dict:
         return self.steps
 
+    @workflows.workflow.query(name="get_grok_auth")
+    def get_grok_auth(self) -> Optional[dict]:
+        return self.grok_auth
+
     @workflows.workflow.entrypoint
     async def run(self, payload: AstroturfMapperInput) -> dict:
         p = payload
+
+        grok_auth = None
+        if p.handle_source in ("grok_cli", "auto"):
+            start = await grok_device_login_start()
+            if start.get("status") == "pending":
+                label = f"grok device login: open {start['verification_url']} and enter code {start['user_code']}"
+                try:
+                    submission = await self.wait_for_input(GrokDeviceLoginInput, label=label, timeout=timedelta(minutes=10))
+                    wait = await grok_device_login_wait(start["pid"])
+                    grok_auth = {**start, "status": wait["status"], "submitted_user_code": submission.user_code}
+                except asyncio.TimeoutError:
+                    grok_auth = {**start, "status": "input_timeout"}
+            else:
+                grok_auth = start
+            self.grok_auth = grok_auth
 
         self.steps["resolve_targets"] = "running"
         targets = await resolve_target_handles(p)
@@ -867,6 +987,7 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         return {
             "workflow": "cn-astroturf-mapper",
             "params": p.model_dump(),
+            "grok_auth": grok_auth,
             "targets": targets,
             "total_ratings_kept": data.get("total_ratings_kept", 0),
             "findings": findings,

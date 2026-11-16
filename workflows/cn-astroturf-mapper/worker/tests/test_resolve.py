@@ -2,7 +2,12 @@
 import asyncio
 import os
 
-from worker.workflows.cn_astroturf_mapper import AstroturfMapperInput, _extract_status_ids, _resolve_handle_grok_cli
+from worker.workflows.cn_astroturf_mapper import (
+    AstroturfMapperInput,
+    _extract_status_ids,
+    _parse_device_login_output,
+    _resolve_handle_grok_cli,
+)
 
 
 def test_extract_status_ids_parses_dedupes_and_filters_by_handle():
@@ -36,3 +41,21 @@ def test_grok_cli_missing_binary_degrades_to_warning():
     assert entry["source"] == "grok_cli"
     assert entry["tweet_ids"] == []
     assert "not found" in entry["warning"]
+
+
+def test_parse_device_login_output_url_with_embedded_code():
+    text = 'To sign in, visit https://accounts.x.ai/oauth2/device?user_code=ABCD-1234 and enter code ABCD-1234\npolling...'
+    out = _parse_device_login_output(text)
+    assert out["verification_url"] == "https://accounts.x.ai/oauth2/device?user_code=ABCD-1234"
+    assert out["user_code"] == "ABCD-1234"
+
+
+def test_parse_device_login_output_bare_code():
+    out = _parse_device_login_output("Open https://x.ai/device and enter code WXYZ-9876 to continue")
+    assert out["verification_url"] == "https://x.ai/device"
+    assert out["user_code"] == "WXYZ-9876"
+
+
+def test_parse_device_login_output_empty():
+    assert _parse_device_login_output("") == {}
+    assert _parse_device_login_output("login failed") == {}
