@@ -63,7 +63,7 @@ pauses on a pending input. Drive the RFC 8628 device-code flow from the client:
   "max_tweets_per_handle": 500,
   "with_replies": false,
   "with_reposts": false,
-  "handle_source": "auto",  // default; "xmd" (x.md only) | "grok_x_search" (xAI API) | "grok_cli" (Grok Build CLI headless)
+  "handle_source": "grok_cli",  // default; "xmd" (x.md only) | "grok_x_search" (xAI API) | "auto" (x.md first, grok fallback)
   "history_scope": "full",  // default: audit ALL community-noted tweets; "recent" = only the latest max_tweets_per_handle posts
   "min_notes_for_rater": 3,
   "min_co_rating_overlap": 0.5,
@@ -84,16 +84,16 @@ pauses on a pending input. Drive the RFC 8628 device-code flow from the client:
 - "last N days" / "past N weeks" / "N months" → `lookback_days`.
 - "include replies" → `with_replies: true`. Never set `with_reposts: true`
   (reposts are other authors' posts).
-- Default is `handle_source: "auto"` — the run pauses once per container for the
-  grok device-code login (see above), then resolves via x.md and falls back to
-  Grok per handle when x.md downgrades it. "use x.md only / skip grok" →
-  `handle_source: "xmd"`.
+- Default is `handle_source: "grok_cli"` — the run pauses once per container for
+  the grok device-code login (see above), resolves via the Grok CLI (which also
+  returns the numeric USER_ID), and falls back to x.md per handle if Grok
+  warns. "use x.md only" → `"xmd"`; "x.md first, grok fallback" → `"auto"`.
 - "use Grok/xAI x search instead of x.md" → `handle_source: "grok_cli"` (Grok
   Build CLI shipped in the worker image; EXPECT the device-code login pause,
   see above) or `"grok_x_search"` (xAI Responses API; needs the `XAI_API_KEY`
   secret on the deployment).
-- "fall back to Grok when x.md fails" → `handle_source: "auto"` (x.md first,
-  then grok_x_search if keyed, then grok_cli).
+- "x.md first, fall back to Grok when x.md fails" → `handle_source: "auto"`
+  (x.md first, then grok_x_search if keyed, then grok_cli).
 - Default `history_scope: "full"` audits every community-noted tweet of each
   target (handle → post IDs → intersect the full CN notes snapshot); "only
   recent posts" → `history_scope: "recent"` with a smaller `max_tweets_per_handle`.

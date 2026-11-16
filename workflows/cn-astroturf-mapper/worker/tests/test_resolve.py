@@ -63,8 +63,8 @@ def test_parse_device_login_output_empty():
     assert _parse_device_login_output("login failed") == {}
 
 
-def test_handle_source_defaults_to_auto():
-    assert AstroturfMapperInput(target_handles=["x"]).handle_source == "auto"
+def test_handle_source_defaults_to_grok_cli():
+    assert AstroturfMapperInput(target_handles=["x"]).handle_source == "grok_cli"
 
 
 def test_history_scope_defaults_to_full_and_caps():
@@ -77,6 +77,7 @@ def test_history_scope_defaults_to_full_and_caps():
 
 def test_parse_user_id():
     assert _parse_user_id("USER_ID: 326756275\nhttps://x.com/a/status/1") == "326756275"
+    assert _parse_user_id('{"userId": "1667249535519805451", "handle": "MistralAI"}') == "1667249535519805451"
     assert _parse_user_id("no id here") is None
     assert _parse_user_id("") is None
 

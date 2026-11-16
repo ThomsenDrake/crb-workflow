@@ -101,7 +101,7 @@ class AstroturfMapperInput(BaseModel):
     max_tweets_per_handle: int = 500
     with_replies: bool = False   # include the account's replies when resolving posts (via x.md)
     with_reposts: bool = False   # never true: reposts are other people's posts, not targets' own
-    handle_source: Literal["xmd", "grok_x_search", "grok_cli", "auto"] = "auto"  # default auto: x.md first + one device-login pause per container, per-handle grok fallback on warning; xmd = x.md only; grok_x_search = xAI Responses API x_search only; grok_cli = Grok Build CLI headless only
+    handle_source: Literal["xmd", "grok_x_search", "grok_cli", "auto"] = "grok_cli"  # default grok_cli: Grok Build CLI headless first (one device-login pause per container), x.md fallback per handle on warning; xmd = x.md only; grok_x_search = xAI Responses API x_search only; auto = x.md first with grok fallback on warning
     history_scope: Literal["recent", "full"] = "full"  # "full" (default) = enumerate the handle's whole history (hard cap max_history_posts) so the audit covers ALL community-noted tweets; "recent" = stop at max_tweets_per_handle
     max_history_posts: int = 50000  # hard cap on enumerated posts when history_scope="full"
     min_notes_for_rater: int = 3          # rater must have rated >= this many target notes to enter cluster analysis
@@ -331,11 +331,11 @@ def _parse_device_login_output(text: str) -> dict:
     return out
 
 
-_USER_ID_RE = re.compile(r"USER_ID:\s*(\d+)")
+_USER_ID_RE = re.compile(r"(?:USER_ID|userId|user_id)\"?\s*[:=]\s*\"?(\d{5,})\"?", re.IGNORECASE)
 
 
 def _parse_user_id(text: str) -> Optional[str]:
-    """Numeric X user id from a resolver's `USER_ID: <id>` line (grok sources echo it on request)."""
+    """Numeric X user id from a resolver's `USER_ID: <id>` line or `"userId": "<id>"` JSON (grok sources echo it on request)."""
     m = _USER_ID_RE.search(text or "")
     return m.group(1) if m else None
 
@@ -423,11 +423,11 @@ async def _resolve_handle_grok_x_search(handle: str, since: str, until: str, p: 
     cap = _post_cap(p)
     query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
     prompt = (
-        f"Use X Search only (no web search). List up to {cap} original posts by "
-        f"@{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the full x.com "
-        "post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first, plus one final "
-        "line 'USER_ID: <numeric profile id>'. This is read-only: do not post, reply, like, repost, or "
-        "follow anything. If no posts are found, reply exactly: NONE"
+        f"Use X Search only (no web search). First, use X Search user search to find @{handle} and put "
+        f"'USER_ID: <numeric profile id>' on the FIRST line of your reply. Then list up to {cap} original "
+        f"posts by @{handle} posted from {since} through {until} (query: {query}) as full x.com post URLs "
+        "(https://x.com/<handle>/status/<id>), one per line, most recent first. This is read-only: do not "
+        "post, reply, like, repost, or follow anything. If no posts are found, reply exactly: NONE"
     )
     body = {
         "model": XAI_XSEARCH_MODEL,
@@ -496,11 +496,11 @@ async def _resolve_handle_grok_cli(handle: str, since: str, until: str, p: Astro
     cap = _post_cap(p)
     query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
     prompt = (
-        f"Use X Search (x_search) only, skip web search. List up to {cap} original "
-        f"posts by @{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the "
-        "full x.com post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first, plus "
-        "one final line 'USER_ID: <numeric profile id>'. This task is read-only: do not post, reply, "
-        "like, repost, or follow anything. If no posts are found, reply exactly: NONE"
+        f"Use X Search (x_search) only, skip web search. First run a user search for @{handle} and put "
+        f"'USER_ID: <numeric profile id>' on the FIRST line of your reply. Then list up to {cap} original "
+        f"posts by @{handle} posted from {since} through {until} (query: {query}) as full x.com post URLs "
+        "(https://x.com/<handle>/status/<id>), one per line, most recent first. This task is read-only: "
+        "do not post, reply, like, repost, or follow anything. If no posts are found, reply exactly: NONE"
     )
     cmd = [bin_path, "--no-subagents", "--no-auto-update", "--max-turns", "6", "--reasoning-effort", "low", "-p", prompt]
     try:
@@ -630,11 +630,6 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     since = (datetime.now(timezone.utc) - timedelta(days=p.lookback_days)).strftime("%Y-%m-%d")
     until = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")  # x_search to_date is exclusive
     out = []
-    if p.handle_source in ("grok_x_search", "grok_cli"):
-        resolver = _resolve_handle_grok_x_search if p.handle_source == "grok_x_search" else _resolve_handle_grok_cli
-        for raw in p.target_handles:
-            out.append(await resolver(raw.lstrip("@"), since, until, p))
-        return out
     headers = {"Accept": "application/json"}
     api_key = os.environ.get("X_MD_API_KEY")
     if api_key:
@@ -642,6 +637,23 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     async with httpx.AsyncClient(base_url="https://mdfromx.com", headers=headers, timeout=300.0) as client:
         for raw in p.target_handles:
             handle = raw.lstrip("@")
+            if p.handle_source in ("grok_x_search", "grok_cli"):
+                resolver = _resolve_handle_grok_x_search if p.handle_source == "grok_x_search" else _resolve_handle_grok_cli
+                entry = await resolver(handle, since, until, p)
+                if p.handle_source == "grok_cli" and entry.get("warning"):
+                    # Grok CLI unavailable/failed for this handle (no binary, not signed in, no posts) -> x.md fallback
+                    x = await _resolve_handle_xmd(client, handle, since, p)
+                    if x.get("tweet_ids"):
+                        entry["tweet_ids"] = x["tweet_ids"]
+                        entry["tweets_scanned"] = x["tweets_scanned"]
+                        if x.get("user_id"):
+                            entry["user_id"] = x["user_id"]
+                        entry["source"] = "grok_cli-warning+xmd"
+                        entry["warning"] = f"grok_cli: {entry['warning']}; recovered via x.md"
+                    else:
+                        entry["warning"] = f"grok_cli: {entry['warning']}; x.md: {x.get('warning', 'no posts')}"
+                out.append(entry)
+                continue
             entry = await _resolve_handle_xmd(client, handle, since, p)
             if p.handle_source == "auto" and entry.get("warning"):
                 note = entry["warning"]

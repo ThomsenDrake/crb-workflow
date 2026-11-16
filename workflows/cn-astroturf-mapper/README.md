@@ -103,7 +103,7 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 | "max_tweets_per_handle" | int | 500 | cap on posts scanned per handle |
 | "with_replies" | bool | false | include the account's replies when resolving posts |
 | "with_reposts" | bool | false | never true — reposts are other authors' posts, not the target's own |
-| "handle_source" | string | "auto" | "auto" (default: x.md first, per-handle Grok fallback on warning; one device-login pause per container), "xmd" (x.md only), "grok_x_search" (xAI Responses API x_search only), "grok_cli" (Grok Build CLI headless only) |
+| "handle_source" | string | "grok_cli" | "grok_cli" (default: Grok Build CLI headless first, one device-login pause per container, x.md fallback per handle on warning), "xmd" (x.md only), "grok_x_search" (xAI Responses API x_search only), "auto" (x.md first with Grok fallback on warning) |
 | "history_scope" | string | "full" | "full" (default: enumerate the handle's whole history, hard cap `max_history_posts`, so the audit covers ALL community-noted tweets) or "recent" (stop at `max_tweets_per_handle`) |
 | "max_history_posts" | int | 50000 | hard cap on enumerated posts when `history_scope="full"` |
 | "min_notes_for_rater" | int | 3 | raters must have rated ≥ this many target notes to enter cluster analysis |
