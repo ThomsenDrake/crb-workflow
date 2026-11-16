@@ -23,8 +23,8 @@ All steps are `@workflows.activity()` functions (durable + retried, so an execut
 
 ## Data sources
 
-- **x.md** (`https://mdfromx.com/docs`) — keyless read-only mirror of public X content. Bulk history route: `GET https://mdfromx.com/api/v1/profiles/{handle}/posts?since=YYYY-MM-DD&max_posts=N&format=json&with_replies=..&with_reposts=false`. Each post's `id` is the numeric tweet ID — exactly what joins to the CN dataset's `tweetId`. `meta.truncated` / `meta.next_until` paginate the walk; 429s raise a clear error. An optional `X_MD_API_KEY` (sent as `Authorization: Bearer`) raises the import allowance (without a key: ~3 imports/hour, 5/day per IP). It is **not** an X API token.
-- **X public Community Notes dataset** — zipped TSV shards under `CN_DATA_BASE` (default `https://ton.twimg.com/birdwatch-public-data`): `notes/`, `ratings/` (~184M rows — always streamed to a temp file and filtered by note ID, never loaded wholesale), and `note-status-history/`. `CN_MAX_SHARDS` caps how many shard indexes are probed per table (default 64); if none respond, the code falls back to the unsharded single-file layout.
+- **x.md** (`https://mdfromx.com/docs`) — keyless read-only mirror of public X content. Bulk history route: `GET https://mdfromx.com/api/v1/profiles/{handle}/posts?since=YYYY-MM-DD&max_posts=N&format=json&with_replies=..&with_reposts=false`. Each post's `id` is the numeric tweet ID — exactly what joins to the CN dataset's `tweetId`. `meta.truncated` / `meta.next_until` paginate the walk; 429s fail with an actionable error, while 403/404/5xx responses only downgrade that handle to a per-handle `warning` so one bad profile doesn't sink the whole run. An optional `X_MD_API_KEY` (sent as `Authorization: Bearer`) raises the import allowance (without a key: ~3 imports/hour, 5/day per IP). It is **not** an X API token.
+- **X public Community Notes dataset** — zipped TSV shards under `CN_DATA_BASE` (default `https://ton.twimg.com/birdwatch-public-data`), organized as **daily snapshots**: `YYYY/MM/DD/notes/notes-NNNNN.zip`, `YYYY/MM/DD/noteRatings/ratings-NNNNN.zip` (~184M rows total — always streamed to a temp file and filtered by note ID, never loaded wholesale), and `YYYY/MM/DD/noteStatusHistory/noteStatusHistory-NNNNN.zip`. The worker walks back up to `CN_LOOKBACK_DAYS` (default 7) days from today to find the latest snapshot; `CN_MAX_SHARDS` caps how many shard indexes are probed per table (default 64). If nothing responds, that table is treated as empty instead of failing the run.
 
 ## Detection signals
 
@@ -118,7 +118,7 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 
 - Participant IDs are never resolved to handles; the report and the LLM prompt both restate this
 - Ratings shards are streamed to a temp file and filtered — the ~184M-row table is never held in memory
-- 429s from x.md fail with an actionable message (set X_MD_API_KEY or lower max_tweets_per_handle)
+- 429s from x.md fail with an actionable message (set X_MD_API_KEY or lower max_tweets_per_handle); 403/404/5xx from x.md only downgrade that handle to a `warning` in the result
 - Reposts are always excluded from target post resolution
 - Findings are framed as hypotheses; organic partisan brigading is a known false-positive source and is called out in the caveats
 
