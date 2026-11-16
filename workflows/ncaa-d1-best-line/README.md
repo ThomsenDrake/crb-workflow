@@ -118,7 +118,7 @@ To run the worker without the CLI: "cd workflows/ncaa-d1-best-line/worker && uv 
 
 Push this repo to GitHub, then create a managed deployment pointing at it — Mistral Cloud builds "deploy/docker/Dockerfile.worker" (build context = repo root) and runs the worker with an injected service-account token, so no API key is committed (the image needs mistralai-workflows >= 3.10):
 
-- github_url: "https://github.com/ThomsenDrake/crb-workflow", revision: a commit SHA on "main"
+- github_url: "https://github.com/ThomsenDrake/dt-personal-workflows", revision: a commit SHA on "main"
 - deployment name: e.g. "crb-workflow-worker" (reuse the same name to update)
 - Via the Studio console (Workflows → Deployments), the API, or the Mistral MCP "deploy_workflow_deployment" tool
 
