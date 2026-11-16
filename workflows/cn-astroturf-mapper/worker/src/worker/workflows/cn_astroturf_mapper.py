@@ -47,9 +47,11 @@ Env vars:
   X_MD_API_KEY    optional x.md API key (Authorization: Bearer). Without it the
                   bulk import is limited to ~3 imports/hour, 5/day per IP; with a
                   key you get your key's import allowance. Never an X token.
-  CN_DATA_BASE    base URL of public CN snapshots
-                  (default https://ton.twimg.com/birdwatch-public-data)
-  CN_MAX_SHARDS   max shard index probed per table (default 64)
+  CN_DATA_BASE      base URL of public CN snapshots
+                    (default https://ton.twimg.com/birdwatch-public-data)
+  CN_LOOKBACK_DAYS  days to walk back from today to find the latest daily
+                    snapshot (default 7)
+  CN_MAX_SHARDS     max shard index probed per table (default 64)
 """
 from __future__ import annotations
 
@@ -331,29 +333,59 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
 
 CN_DATA_BASE = os.environ.get("CN_DATA_BASE", "https://ton.twimg.com/birdwatch-public-data")
 CN_MAX_SHARDS = int(os.environ.get("CN_MAX_SHARDS", "64"))
-# table dir name -> file prefix (override via env if X changes layout)
+CN_LOOKBACK_DAYS = int(os.environ.get("CN_LOOKBACK_DAYS", "7"))  # snapshots are daily best-effort; walk back if today's is missing
+# table -> candidate (dir, prefix) pairs; X has used both camelCase and kebab-case dir names
 CN_TABLES = {
-    "notes": ("notes", "notes"),
-    "ratings": ("ratings", "ratings"),
-    "status": ("note-status-history", "note-status-history"),
+    "notes": [("notes", "notes")],
+    "ratings": [("noteRatings", "ratings"), ("ratings", "ratings")],
+    "status": [("noteStatusHistory", "noteStatusHistory"), ("note-status-history", "note-status-history")],
 }
 
 
-async def _shard_urls(client: httpx.AsyncClient, table_dir: str, prefix: str) -> list[str]:
+async def _shard_urls(client: httpx.AsyncClient, candidates: list) -> list[str]:
+    """Resolve the current snapshot's shard URLs for a table.
+
+    Layout (as of 2026): {CN_DATA_BASE}/YYYY/MM/DD/<table-dir>/<prefix>-NNNNN.zip,
+    one snapshot per day. Walk back up to CN_LOOKBACK_DAYS from today until shard
+    00000 exists, then enumerate contiguous shards. Falls back to the legacy
+    undated layout, then to [] (caller treats that as "no data").
+    """
     import httpx
 
-    urls = []
-    for i in range(CN_MAX_SHARDS):
-        url = f"{CN_DATA_BASE}/{table_dir}/{prefix}-{i:05d}.zip"
+    today = datetime.now(timezone.utc).date()
+    date_dirs = [(today - timedelta(days=i)).strftime("%Y/%m/%d") for i in range(CN_LOOKBACK_DAYS)]
+    date_dirs.append("")  # legacy undated layout
+    for table_dir, prefix in candidates:
+        for dd in date_dirs:
+            base = f"{CN_DATA_BASE}/{dd}" if dd else CN_DATA_BASE
+            first = f"{base}/{table_dir}/{prefix}-00000.zip"
+            try:
+                r = await client.head(first, follow_redirects=True)
+                if r.status_code != 200:
+                    continue
+            except httpx.HTTPError:
+                continue
+            urls = [first]
+            for i in range(1, CN_MAX_SHARDS):
+                url = f"{base}/{table_dir}/{prefix}-{i:05d}.zip"
+                try:
+                    r = await client.head(url, follow_redirects=True)
+                except httpx.HTTPError:
+                    break
+                if r.status_code == 200:
+                    urls.append(url)
+                else:
+                    break  # shards are contiguous from 00000
+            return urls
+        # legacy unsharded single file
+        single = f"{CN_DATA_BASE}/{table_dir}/{prefix}.zip"
         try:
-            resp = await client.head(url, follow_redirects=True)
-            if resp.status_code == 200:
-                urls.append(url)
+            r = await client.head(single, follow_redirects=True)
+            if r.status_code == 200:
+                return [single]
         except httpx.HTTPError:
-            continue
-    if not urls:  # fall back to unsharded single file
-        urls = [f"{CN_DATA_BASE}/{table_dir}/{prefix}.zip"]
-    return urls
+            pass
+    return []
 
 
 async def _aiter_tsv_rows(client: httpx.AsyncClient, url: str):
@@ -391,7 +423,7 @@ async def load_target_notes(target_tweet_ids: set) -> list[dict]:
     import httpx
 
     async with httpx.AsyncClient(timeout=120.0) as client:
-        urls = await _shard_urls(client, *CN_TABLES["notes"])
+        urls = await _shard_urls(client, CN_TABLES["notes"])
         notes = []
         for url in urls:
             async for row in _aiter_tsv_rows(client, url):
@@ -416,7 +448,7 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> d
     status_by_note = defaultdict(list)
     async with httpx.AsyncClient(timeout=120.0) as client:
         # ratings
-        for url in await _shard_urls(client, *CN_TABLES["ratings"]):
+        for url in await _shard_urls(client, CN_TABLES["ratings"]):
             async for row in _aiter_tsv_rows(client, url):
                 nid = row.get("noteId")
                 if nid in target_note_ids:
@@ -428,7 +460,7 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> d
                     })
         # status history
         if detect_flips:
-            for url in await _shard_urls(client, *CN_TABLES["status"]):
+            for url in await _shard_urls(client, CN_TABLES["status"]):
                 async for row in _aiter_tsv_rows(client, url):
                     nid = row.get("noteId")
                     if nid in target_note_ids:
