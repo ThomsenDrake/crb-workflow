@@ -64,6 +64,7 @@ pauses on a pending input. Drive the RFC 8628 device-code flow from the client:
   "with_replies": false,
   "with_reposts": false,
   "handle_source": "auto",  // default; "xmd" (x.md only) | "grok_x_search" (xAI API) | "grok_cli" (Grok Build CLI headless)
+  "history_scope": "full",  // default: audit ALL community-noted tweets; "recent" = only the latest max_tweets_per_handle posts
   "min_notes_for_rater": 3,
   "min_co_rating_overlap": 0.5,
   "min_cluster_size": 5,
@@ -93,6 +94,9 @@ pauses on a pending input. Drive the RFC 8628 device-code flow from the client:
   secret on the deployment).
 - "fall back to Grok when x.md fails" → `handle_source: "auto"` (x.md first,
   then grok_x_search if keyed, then grok_cli).
+- Default `history_scope: "full"` audits every community-noted tweet of each
+  target (handle → post IDs → intersect the full CN notes snapshot); "only
+  recent posts" → `history_scope: "recent"` with a smaller `max_tweets_per_handle`.
 - "more/less sensitive" → lower/raise `min_cluster_size` and
   `min_co_rating_overlap`; "faster/slower burst" → `burst_window_minutes` /
   `burst_min_ratings`.

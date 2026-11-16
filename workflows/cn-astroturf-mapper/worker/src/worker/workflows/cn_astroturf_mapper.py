@@ -16,14 +16,19 @@ law; attribution requires external data and is out of scope here.
 Pipeline (each step is an @workflows.activity so all side effects are durable
 and retried; the entrypoint stays deterministic):
 
-  1. resolve_target_handles  handles -> recent post IDs via x.md
+  1. resolve_target_handles  handles -> user id + post IDs (full history when
+                             history_scope="full", the default) via x.md
                              (https://mdfromx.com/docs, GET /api/v1/profiles/{handle}/posts;
                              plain GET, no X credentials), or — when input handle_source is
                              "grok_x_search"/"grok_cli"/"auto" — via Grok X Search: the xAI
                              Responses API x_search tool (XAI_API_KEY; billed per post
                              fetched) or the Grok Build CLI in headless mode (its own cached
                              login; headless -p is documented for scripts/CI)
-  2. load_target_notes       CN public data: notes attached to those tweets
+  2. load_target_notes       CN public data: notes attached to those tweets — i.e. the
+                             target's community-NOTED tweets. The notes table has no
+                             tweet-author column (verified against the live shard header),
+                             so the backward join is: handle -> post IDs -> intersect the
+                             full notes snapshot; the audit then runs on that noted set
   3. load_ratings_and_status CN public data: ratings + status history for those
                              notes (streamed + filtered, the ratings table is
                              ~184M rows so it is never loaded wholesale)
@@ -97,6 +102,8 @@ class AstroturfMapperInput(BaseModel):
     with_replies: bool = False   # include the account's replies when resolving posts (via x.md)
     with_reposts: bool = False   # never true: reposts are other people's posts, not targets' own
     handle_source: Literal["xmd", "grok_x_search", "grok_cli", "auto"] = "auto"  # default auto: x.md first + one device-login pause per container, per-handle grok fallback on warning; xmd = x.md only; grok_x_search = xAI Responses API x_search only; grok_cli = Grok Build CLI headless only
+    history_scope: Literal["recent", "full"] = "full"  # "full" (default) = enumerate the handle's whole history (hard cap max_history_posts) so the audit covers ALL community-noted tweets; "recent" = stop at max_tweets_per_handle
+    max_history_posts: int = 50000  # hard cap on enumerated posts when history_scope="full"
     min_notes_for_rater: int = 3          # rater must have rated >= this many target notes to enter cluster analysis
     min_co_rating_overlap: float = 0.5    # Jaccard overlap threshold for linking two raters
     min_cluster_size: int = 5             # cluster must have >= this many raters to be flagged
@@ -324,6 +331,20 @@ def _parse_device_login_output(text: str) -> dict:
     return out
 
 
+_USER_ID_RE = re.compile(r"USER_ID:\s*(\d+)")
+
+
+def _parse_user_id(text: str) -> Optional[str]:
+    """Numeric X user id from a resolver's `USER_ID: <id>` line (grok sources echo it on request)."""
+    m = _USER_ID_RE.search(text or "")
+    return m.group(1) if m else None
+
+
+def _post_cap(p: AstroturfMapperInput) -> int:
+    """Effective enumeration cap: full history walk when history_scope='full', else the recent-posts cap."""
+    return p.max_history_posts if p.history_scope == "full" else p.max_tweets_per_handle
+
+
 async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMapperInput) -> dict:
     """x.md bulk-history route for one handle (see module docs). Degrades to a per-handle warning on 403/404/5xx."""
     seen = set()
@@ -331,10 +352,11 @@ async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMappe
     until = None
     body = {}
     warning = None
-    while len(tweet_ids) < p.max_tweets_per_handle:
+    cap = _post_cap(p)
+    while len(tweet_ids) < cap:
         params = {
             "since": since,
-            "max_posts": min(5000, p.max_tweets_per_handle - len(tweet_ids) + 1),
+            "max_posts": min(5000, cap - len(tweet_ids) + 1),
             "format": "json",
             "with_replies": "true" if p.with_replies else "false",
             "with_reposts": "false",  # reposts are the ORIGINAL author's post — exclude
@@ -366,15 +388,15 @@ async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMappe
                 seen.add(pid)
                 tweet_ids.append(pid)
         meta = body.get("meta", {})
-        if meta.get("truncated") and meta.get("next_until") and len(tweet_ids) < p.max_tweets_per_handle:
+        if meta.get("truncated") and meta.get("next_until") and len(tweet_ids) < cap:
             until = meta["next_until"]  # continue the walk; dedupe boundary via `seen`
         else:
             break
     entry = {
         "handle": handle,
         "user_id": (body.get("profile") or {}).get("id") if body.get("profile") else None,
-        "tweet_ids": tweet_ids[: p.max_tweets_per_handle],
-        "tweets_scanned": len(tweet_ids[: p.max_tweets_per_handle]),
+        "tweet_ids": tweet_ids[:cap],
+        "tweets_scanned": len(tweet_ids[:cap]),
         "source": "xmd",
     }
     if warning:
@@ -398,12 +420,14 @@ async def _resolve_handle_grok_x_search(handle: str, since: str, until: str, p: 
     if not api_key:
         entry["warning"] = "XAI_API_KEY not set; grok_x_search source unavailable for this handle"
         return entry
+    cap = _post_cap(p)
     query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
     prompt = (
-        f"Use X Search only (no web search). List up to {p.max_tweets_per_handle} original posts by "
+        f"Use X Search only (no web search). List up to {cap} original posts by "
         f"@{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the full x.com "
-        "post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first. This is "
-        "read-only: do not post, reply, like, repost, or follow anything. If no posts are found, reply exactly: NONE"
+        "post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first, plus one final "
+        "line 'USER_ID: <numeric profile id>'. This is read-only: do not post, reply, like, repost, or "
+        "follow anything. If no posts are found, reply exactly: NONE"
     )
     body = {
         "model": XAI_XSEARCH_MODEL,
@@ -443,7 +467,8 @@ async def _resolve_handle_grok_x_search(handle: str, since: str, until: str, p: 
                         texts.append(a["url"])
     ids = _extract_status_ids("\n".join(texts), handle)
     usage = (resp.get("usage") or {}).get("server_side_tool_usage_details") or {}
-    entry["tweet_ids"] = ids[: p.max_tweets_per_handle]
+    entry["user_id"] = _parse_user_id("\n".join(texts))
+    entry["tweet_ids"] = ids[:cap]
     entry["tweets_scanned"] = len(entry["tweet_ids"])
     if usage.get("x_posts_fetched"):
         entry["x_posts_fetched"] = usage["x_posts_fetched"]
@@ -468,13 +493,14 @@ async def _resolve_handle_grok_cli(handle: str, since: str, until: str, p: Astro
     if shutil.which(bin_path) is None and not os.path.exists(bin_path):
         entry["warning"] = f"grok CLI not found ({bin_path}); grok_cli source unavailable for this handle"
         return entry
+    cap = _post_cap(p)
     query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
     prompt = (
-        f"Use X Search (x_search) only, skip web search. List up to {p.max_tweets_per_handle} original "
+        f"Use X Search (x_search) only, skip web search. List up to {cap} original "
         f"posts by @{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the "
-        "full x.com post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first. "
-        "This task is read-only: do not post, reply, like, repost, or follow anything. "
-        "If no posts are found, reply exactly: NONE"
+        "full x.com post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first, plus "
+        "one final line 'USER_ID: <numeric profile id>'. This task is read-only: do not post, reply, "
+        "like, repost, or follow anything. If no posts are found, reply exactly: NONE"
     )
     cmd = [bin_path, "--no-subagents", "--no-auto-update", "--max-turns", "6", "--reasoning-effort", "low", "-p", prompt]
     try:
@@ -498,8 +524,10 @@ async def _resolve_handle_grok_cli(handle: str, since: str, until: str, p: Astro
         tail = err_b.decode(errors="replace")[-300:]
         entry["warning"] = f"grok CLI exited {proc.returncode} for @{handle} (not signed in? run `grok login --device-code`): {tail}"
         return entry
-    ids = _extract_status_ids(out_b.decode(errors="replace"), handle)
-    entry["tweet_ids"] = ids[: p.max_tweets_per_handle]
+    out_text = out_b.decode(errors="replace")
+    ids = _extract_status_ids(out_text, handle)
+    entry["user_id"] = _parse_user_id(out_text)
+    entry["tweet_ids"] = ids[:cap]
     entry["tweets_scanned"] = len(entry["tweet_ids"])
     if not ids:
         entry["warning"] = f"grok CLI found no posts for @{handle} in the requested window"
@@ -840,6 +868,7 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             "tweets_scanned": t["tweets_scanned"],
             "notes_on_their_posts": len(h_notes),
             "note_ids": sorted(h_note_ids),
+            "noted_tweet_ids": sorted({n["tweetId"] for n in h_notes}),
             "clusters": h_clusters,
             "bursts": h_bursts,
             "status_flips": h_flips,
@@ -871,6 +900,7 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
             h: {
                 "tweets_scanned": v["tweets_scanned"],
                 "notes_on_their_posts": v["notes_on_their_posts"],
+                "noted_tweets": len(v.get("noted_tweet_ids") or []),
                 "coordination_score": v["coordination_score"],
                 "severity": v["severity"],
                 "n_clusters": len(v["clusters"]),
@@ -1018,6 +1048,7 @@ def _render_markdown(targets: list, findings: dict, assessment: Optional[dict], 
         lines += [
             f"### @{h} — severity: **{v['severity']}** (score {v['coordination_score']}/100)",
             f"- tweets scanned: {v['tweets_scanned']}, notes on their posts: {v['notes_on_their_posts']}",
+            f"- noted tweets audited (posts with Community Notes): {len(v.get('noted_tweet_ids') or [])} (of {v['tweets_scanned']} scanned; history_scope={p.history_scope})",
             f"- co-rating clusters: {len(v['clusters'])} (sizes: {[c['size'] for c in v['clusters']]})",
             f"- rating bursts: {len(v['bursts'])}, status flips: {len(v['status_flips'])}",
             "",

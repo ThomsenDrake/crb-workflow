@@ -21,6 +21,8 @@ flowchart LR
 
 All steps are `@workflows.activity()` functions (durable + retried, so an execution resumes after a worker restart); the `@workflows.workflow.define(name="cn-astroturf-mapper")` entrypoint stays deterministic. The `get_steps` query exposes live per-step progress.
 
+**Methodology (backward audit):** the CN notes table has no tweet-author column (verified against the live shard header: `noteId, noteAuthorParticipantId, createdAtMillis, tweetId, …`), so the noted-tweet set is built by joining handle → post IDs (full history when `history_scope="full"`) against the full notes snapshot: `load_target_notes` keeps every note whose `tweetId` is one of the target's posts — i.e. all of the target's community-noted tweets — and the coordination audit (ratings/status filtered to those note IDs) runs on exactly that set. Per-handle `findings.*.noted_tweet_ids` lists the audited tweets.
+
 ## Data sources
 
 - **x.md** (`https://mdfromx.com/docs`) — keyless read-only mirror of public X content. Bulk history route: `GET https://mdfromx.com/api/v1/profiles/{handle}/posts?since=YYYY-MM-DD&max_posts=N&format=json&with_replies=..&with_reposts=false`. Each post's `id` is the numeric tweet ID — exactly what joins to the CN dataset's `tweetId`. `meta.truncated` / `meta.next_until` paginate the walk; 429s fail with an actionable error, while 403/404/5xx responses only downgrade that handle to a per-handle `warning` so one bad profile doesn't sink the whole run. An optional `X_MD_API_KEY` (sent as `Authorization: Bearer`) raises the import allowance (without a key: ~3 imports/hour, 5/day per IP). It is **not** an X API token.
@@ -102,6 +104,8 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 | "with_replies" | bool | false | include the account's replies when resolving posts |
 | "with_reposts" | bool | false | never true — reposts are other authors' posts, not the target's own |
 | "handle_source" | string | "auto" | "auto" (default: x.md first, per-handle Grok fallback on warning; one device-login pause per container), "xmd" (x.md only), "grok_x_search" (xAI Responses API x_search only), "grok_cli" (Grok Build CLI headless only) |
+| "history_scope" | string | "full" | "full" (default: enumerate the handle's whole history, hard cap `max_history_posts`, so the audit covers ALL community-noted tweets) or "recent" (stop at `max_tweets_per_handle`) |
+| "max_history_posts" | int | 50000 | hard cap on enumerated posts when `history_scope="full"` |
 | "min_notes_for_rater" | int | 3 | raters must have rated ≥ this many target notes to enter cluster analysis |
 | "min_co_rating_overlap" | float | 0.5 | Jaccard overlap threshold for linking two raters |
 | "min_cluster_size" | int | 5 | cluster must have ≥ this many raters to be flagged |
@@ -114,9 +118,9 @@ To ship a new version: push to "main" and redeploy the same deployment name.
 ## Output schema
 
 - "workflow", "params" (echoed input)
-- "targets": per handle — resolved user id (if the source returned one), tweet IDs scanned, `source` ("xmd" / "grok_x_search" / "grok_cli" / "auto:..."), optional `x_posts_fetched` (xAI usage), warnings (e.g. unreadable profile)
+- "targets": per handle — resolved user id (if the source returned one), tweet IDs scanned, `source` ("xmd" / "grok_x_search" / "grok_cli" / "auto:..."), optional `x_posts_fetched` (xAI usage), warnings (e.g. unreadable profile); per-handle `user_id` when the source returned one
 - "total_ratings_kept": ratings rows kept after filtering to target notes
-- "findings": "per_handle" (notes_on_their_posts, clusters with pseudonymous member IDs, bursts, status_flips, coordination_score, severity), "all_clusters", "notes" (with author_participant_id — pseudonymous only)
+- "findings": "per_handle" (notes_on_their_posts, noted_tweet_ids — the audited set of noted tweets, clusters with pseudonymous member IDs, bursts, status_flips, coordination_score, severity), "all_clusters", "notes" (with author_participant_id — pseudonymous only)
 - "llm_assessment": overall_summary, per-handle verdicts (targeted, severity, evidence, recommended_actions), methodology_caveats
 - "report_markdown": full human-readable report
 - "disclaimer": pseudonymous-only / hypothesis-not-proof text
