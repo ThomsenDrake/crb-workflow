@@ -30,18 +30,29 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
 2. Poll `get_workflow_execution` with the returned `execution_id` until
    `status` is `COMPLETED` or `FAILED` (use `read_workflow_execution_events`
    with `wait_seconds` between polls for progress; on `FAILED`, read
-   `get_workflow_execution_logs` and report the failure, then stop).
-3. If the input used `handle_source` "grok_cli"/"auto" and the worker has no
-   cached grok login, the run pauses on a pending input. Drive the device-code
-   login (RFC 8628) from the client:
-   - `query_workflow_execution` with `query_name` `__get_pending_inputs` (or
-     `get_grok_auth`) — find the pending task whose `label` starts with
-     "grok device login: open <url> and enter code <code>".
-   - Tell the user to open that URL and enter the code, then submit:
-     `update_workflow_execution` with `update_name` `__submit_input` and
-     `input` `{"task_id": <task_id>, "input": {"user_code": "<code>"}}`.
-   - Then poll `get_grok_auth` until `status` is "authenticated" (or the run
-     finishes with a per-handle `warning` if login timed out).
+   `get_workflow_execution_logs` and report the failure, then stop). On each
+   poll, also run `query_workflow_execution` with `query_name`
+   `__get_pending_inputs`: with `handle_source` "grok_cli"/"auto" the run is
+   EXPECTED to pause once on a device-login pending input — drive it as below.
+
+## Grok device-code login (expected with handle_source "grok_cli"/"auto")
+
+The worker image ships the Grok Build CLI (`GROK_BIN=grok`). The first
+`grok_cli`/`auto` run per container has no cached login, so the execution
+pauses on a pending input. Drive the RFC 8628 device-code flow from the client:
+
+1. `query_workflow_execution` with `query_name` `__get_pending_inputs` —
+   find the entry whose `label` starts with
+   "grok device login: open <url> and enter code <code>" (same info via
+   `get_grok_auth`).
+2. Tell the user to open <url> in a browser and enter <code> with their
+   grok.com / X login. The code is a confirmation echo, never a credential.
+3. Submit: `update_workflow_execution` with `update_name` `__submit_input`,
+   `input` `{"task_id": <task_id>, "input": {"user_code": "<code>"}}`.
+4. The background `grok login --device-auth` poll then completes and writes
+   `GROK_HOME/auth.json`; `get_grok_auth` shows `status: "authenticated"` and
+   the run resumes. If the 10-minute input window lapses, the run finishes
+   with a per-handle `warning` instead of failing.
 
 ## Input
 
@@ -72,10 +83,12 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
 - "last N days" / "past N weeks" / "N months" → `lookback_days`.
 - "include replies" → `with_replies: true`. Never set `with_reposts: true`
   (reposts are other authors' posts).
-- "use Grok/xAI x search instead of x.md" → `handle_source: "grok_x_search"`
-  (xAI Responses API, needs the `XAI_API_KEY` secret) or `"grok_cli"` (Grok
-  Build CLI headless `grok -p`, needs the CLI installed + its cached login);
-  "fall back to Grok when x.md fails" → `handle_source: "auto"`.
+- "use Grok/xAI x search instead of x.md" → `handle_source: "grok_cli"` (Grok
+  Build CLI shipped in the worker image; EXPECT the device-code login pause,
+  see above) or `"grok_x_search"` (xAI Responses API; needs the `XAI_API_KEY`
+  secret on the deployment).
+- "fall back to Grok when x.md fails" → `handle_source: "auto"` (x.md first,
+  then grok_x_search if keyed, then grok_cli).
 - "more/less sensitive" → lower/raise `min_cluster_size` and
   `min_co_rating_overlap`; "faster/slower burst" → `burst_window_minutes` /
   `burst_min_ratings`.
@@ -126,7 +139,8 @@ Summarize for the user from `result`:
   or check the xAI team rate limits. x_search is billed per post fetched
   ($5/1k posts), reported per handle as `x_posts_fetched`.
 - `warning` containing "grok CLI not found" / "grok CLI exited" (with
-  `handle_source` "grok_cli"/"auto") → the worker image needs the grok binary
-  (`GROK_BIN`) and its cached login (`GROK_HOME` / `~/.grok/auth.json` from
-  `grok login --device-code`, supplied as a secret — the workflow never reads
-  or logs the token file).
+  `handle_source` "grok_cli"/"auto") → the worker image must include the grok
+  binary (see `deploy/docker/Dockerfile.cn-astroturf-mapper`, `GROK_BIN=grok`);
+  if the binary is present but login failed, re-run and complete the device-code
+  pending input when it appears (see above). The workflow never reads or logs
+  the token file.
