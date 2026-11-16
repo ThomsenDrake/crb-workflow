@@ -63,3 +63,11 @@ def test_parse_device_login_output_empty():
 
 def test_handle_source_defaults_to_auto():
     assert AstroturfMapperInput(target_handles=["x"]).handle_source == "auto"
+
+
+def test_workflow_init_initializes_interactive_wait_state():
+    from worker.workflows.cn_astroturf_mapper import CnAstroturfMapper
+
+    w = CnAstroturfMapper()
+    assert w._pending_inputs == {}
+    assert w._pending_wait_count == 0

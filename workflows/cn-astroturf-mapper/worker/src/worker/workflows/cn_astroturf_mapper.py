@@ -927,6 +927,7 @@ async def llm_campaign_assessment(findings: dict, p: AstroturfMapperInput) -> di
 )
 class CnAstroturfMapper(workflows.InteractiveWorkflow):
     def __init__(self):
+        super().__init__()  # InteractiveWorkflow: _pending_inputs / _pending_wait_count (needed by wait_for_input)
         self.steps = {k: "pending" for k in ("resolve_targets", "load_notes", "load_ratings", "detect", "assess")}
         self.grok_auth: Optional[dict] = None
 
