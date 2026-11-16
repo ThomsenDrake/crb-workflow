@@ -96,7 +96,7 @@ class AstroturfMapperInput(BaseModel):
     max_tweets_per_handle: int = 500
     with_replies: bool = False   # include the account's replies when resolving posts (via x.md)
     with_reposts: bool = False   # never true: reposts are other people's posts, not targets' own
-    handle_source: Literal["xmd", "grok_x_search", "grok_cli", "auto"] = "xmd"  # xmd = x.md only; grok_x_search = xAI Responses API x_search only; grok_cli = Grok Build CLI headless only; auto = x.md with per-handle grok fallback on warning
+    handle_source: Literal["xmd", "grok_x_search", "grok_cli", "auto"] = "auto"  # default auto: x.md first + one device-login pause per container, per-handle grok fallback on warning; xmd = x.md only; grok_x_search = xAI Responses API x_search only; grok_cli = Grok Build CLI headless only
     min_notes_for_rater: int = 3          # rater must have rated >= this many target notes to enter cluster analysis
     min_co_rating_overlap: float = 0.5    # Jaccard overlap threshold for linking two raters
     min_cluster_size: int = 5             # cluster must have >= this many raters to be flagged
