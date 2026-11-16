@@ -274,6 +274,8 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
             seen = set()
             tweet_ids = []
             until = None
+            body = {}
+            warning = None
             while len(tweet_ids) < p.max_tweets_per_handle:
                 params = {
                     "since": since,
@@ -290,9 +292,8 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
                         f"x.md rate limited on @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
                         "set X_MD_API_KEY for a higher import allowance or reduce max_tweets_per_handle"
                     )
-                if r.status_code == 404:
-                    out.append({"handle": handle, "user_id": None, "tweet_ids": [], "tweets_scanned": 0,
-                                "warning": "profile not found or not publicly readable via x.md"})
+                if r.status_code in (403, 404):
+                    warning = "profile not found or not publicly readable via x.md"
                     break
                 r.raise_for_status()
                 body = r.json()
@@ -306,12 +307,15 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
                     until = meta["next_until"]  # continue the walk; dedupe boundary via `seen`
                 else:
                     break
-            out.append({
+            entry = {
                 "handle": handle,
                 "user_id": (body.get("profile") or {}).get("id") if body.get("profile") else None,
                 "tweet_ids": tweet_ids[: p.max_tweets_per_handle],
                 "tweets_scanned": len(tweet_ids[: p.max_tweets_per_handle]),
-            })
+            }
+            if warning:
+                entry["warning"] = warning
+            out.append(entry)
     return out
 
 
