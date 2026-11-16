@@ -1,3 +1,4 @@
+successfully downloaded text file (SHA: 3983d78a806fbe9acb4b09cc53bfc5c8df0e781c)
 """
 cn-astroturf-mapper — Mistral Workflow (Studio, Temporal-backed)
 
@@ -51,6 +52,7 @@ Env vars:
                   (default https://ton.twimg.com/birdwatch-public-data)
   CN_MAX_SHARDS   max shard index probed per table (default 64)
 """
+from __future__ import annotations
 
 import csv
 import hashlib
@@ -63,7 +65,6 @@ from collections import defaultdict
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-import httpx
 from pydantic import BaseModel, Field
 
 import mistralai.workflows as workflows
@@ -260,6 +261,8 @@ def score_handle(n_notes: int, clusters: list, bursts: list, flips: list) -> tup
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=15), retry_policy_max_attempts=3)
 async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
+    import httpx
+
     since = (datetime.now(timezone.utc) - timedelta(days=p.lookback_days)).strftime("%Y-%m-%d")
     headers = {"Accept": "application/json"}
     api_key = os.environ.get("X_MD_API_KEY")
@@ -326,6 +329,8 @@ CN_TABLES = {
 
 
 async def _shard_urls(client: httpx.AsyncClient, table_dir: str, prefix: str) -> list[str]:
+    import httpx
+
     urls = []
     for i in range(CN_MAX_SHARDS):
         url = f"{CN_DATA_BASE}/{table_dir}/{prefix}-{i:05d}.zip"
@@ -372,6 +377,8 @@ async def _aiter_tsv_rows(client: httpx.AsyncClient, url: str):
 @workflows.activity(start_to_close_timeout=timedelta(hours=2), retry_policy_max_attempts=1)
 async def load_target_notes(target_tweet_ids: set) -> list[dict]:
     """Notes attached to any target tweet."""
+    import httpx
+
     async with httpx.AsyncClient(timeout=120.0) as client:
         urls = await _shard_urls(client, *CN_TABLES["notes"])
         notes = []
@@ -392,6 +399,8 @@ async def load_target_notes(target_tweet_ids: set) -> list[dict]:
 @workflows.activity(start_to_close_timeout=timedelta(hours=3), retry_policy_max_attempts=1)
 async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> dict:
     """Ratings + note status history restricted to target notes (streamed)."""
+    import httpx
+
     ratings_by_note = defaultdict(list)
     status_by_note = defaultdict(list)
     async with httpx.AsyncClient(timeout=120.0) as client:
