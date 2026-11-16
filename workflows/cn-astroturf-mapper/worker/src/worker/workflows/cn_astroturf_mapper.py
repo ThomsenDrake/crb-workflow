@@ -16,9 +16,11 @@ law; attribution requires external data and is out of scope here.
 Pipeline (each step is an @workflows.activity so all side effects are durable
 and retried; the entrypoint stays deterministic):
 
-  1. resolve_target_handles  x.md (https://mdfromx.com/docs): handles -> recent
-                             post IDs via GET /api/v1/profiles/{handle}/posts
-                             (plain GET, no X credentials needed)
+  1. resolve_target_handles  handles -> recent post IDs via x.md
+                             (https://mdfromx.com/docs, GET /api/v1/profiles/{handle}/posts;
+                             plain GET, no X credentials) or, when input handle_source is
+                             "grok_x_search"/"auto", via xAI's Grok X Search tool
+                             (published xAI Responses API, XAI_API_KEY; billed per post fetched)
   2. load_target_notes       CN public data: notes attached to those tweets
   3. load_ratings_and_status CN public data: ratings + status history for those
                              notes (streamed + filtered, the ratings table is
@@ -47,6 +49,12 @@ Env vars:
   X_MD_API_KEY    optional x.md API key (Authorization: Bearer). Without it the
                   bulk import is limited to ~3 imports/hour, 5/day per IP; with a
                   key you get your key's import allowance. Never an X token.
+  XAI_API_KEY     optional xAI API key enabling the grok_x_search handle source
+                  (xAI Responses API x_search tool; billed per post fetched — an
+                  xAI meter, not X's pay-per-use API). Never an X token or a
+                  grok.com login.
+  XAI_API_BASE    xAI API base URL (default https://api.x.ai/v1)
+  XAI_XSEARCH_MODEL  model used for x_search calls (default grok-4.7)
   CN_DATA_BASE      base URL of public CN snapshots
                     (default https://ton.twimg.com/birdwatch-public-data)
   CN_LOOKBACK_DAYS  days to walk back from today to find the latest daily
@@ -60,11 +68,12 @@ import hashlib
 import io
 import json
 import os
+import re
 import tempfile
 import zipfile
 from collections import defaultdict
 from datetime import datetime, timedelta, timezone
-from typing import Optional
+from typing import Literal, Optional
 
 from pydantic import BaseModel, Field
 
@@ -80,6 +89,7 @@ class AstroturfMapperInput(BaseModel):
     max_tweets_per_handle: int = 500
     with_replies: bool = False   # include the account's replies when resolving posts (via x.md)
     with_reposts: bool = False   # never true: reposts are other people's posts, not targets' own
+    handle_source: Literal["xmd", "grok_x_search", "auto"] = "xmd"  # xmd = x.md only; grok_x_search = xAI Grok x_search only; auto = x.md with per-handle grok fallback on warning
     min_notes_for_rater: int = 3          # rater must have rated >= this many target notes to enter cluster analysis
     min_co_rating_overlap: float = 0.5    # Jaccard overlap threshold for linking two raters
     min_cluster_size: int = 5             # cluster must have >= this many raters to be flagged
@@ -260,71 +270,184 @@ def score_handle(n_notes: int, clusters: list, bursts: list, flips: list) -> tup
 # `tweetId` column. Optional X_MD_API_KEY raises the import rate allowance.
 
 
+XAI_API_BASE = os.environ.get("XAI_API_BASE", "https://api.x.ai/v1")
+XAI_XSEARCH_MODEL = os.environ.get("XAI_XSEARCH_MODEL", "grok-4.7")
+
+_STATUS_URL_RE = re.compile(r"(?:x\.com|twitter\.com)/([A-Za-z0-9_]{1,20})/status(?:es)?/(\d+)", re.IGNORECASE)
+
+
+def _extract_status_ids(text: str, handle: Optional[str] = None) -> list[str]:
+    """Numeric tweet IDs from x.com status URLs in `text`, deduped in order, optionally restricted to one handle."""
+    seen = set()
+    out = []
+    for m in _STATUS_URL_RE.finditer(text or ""):
+        if handle and m.group(1).lower() != handle.lower():
+            continue
+        sid = m.group(2)
+        if sid not in seen:
+            seen.add(sid)
+            out.append(sid)
+    return out
+
+
+async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMapperInput) -> dict:
+    """x.md bulk-history route for one handle (see module docs). Degrades to a per-handle warning on 403/404/5xx."""
+    seen = set()
+    tweet_ids = []
+    until = None
+    body = {}
+    warning = None
+    while len(tweet_ids) < p.max_tweets_per_handle:
+        params = {
+            "since": since,
+            "max_posts": min(5000, p.max_tweets_per_handle - len(tweet_ids) + 1),
+            "format": "json",
+            "with_replies": "true" if p.with_replies else "false",
+            "with_reposts": "false",  # reposts are the ORIGINAL author's post — exclude
+        }
+        if until:
+            params["until"] = until
+        r = await client.get(f"/api/v1/profiles/{handle}/posts", params=params)
+        if r.status_code == 429:
+            raise RuntimeError(
+                f"x.md rate limited on @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
+                "set X_MD_API_KEY for a higher import allowance or reduce max_tweets_per_handle"
+            )
+        if r.status_code in (403, 404):
+            warning = "profile not found or not publicly readable via x.md"
+            break
+        if r.status_code >= 500:
+            # x.md bulk-import occasionally 500s (e.g. very large profiles); degrade per-handle
+            warning = f"x.md returned HTTP {r.status_code} for @{handle}; no posts resolved for this handle"
+            break
+        r.raise_for_status()
+        try:
+            body = r.json()
+        except ValueError:
+            warning = f"x.md returned a non-JSON response for @{handle}; no posts resolved for this handle"
+            break
+        for post in body.get("posts", []):
+            pid = str(post.get("id") or "")
+            if pid and pid not in seen:
+                seen.add(pid)
+                tweet_ids.append(pid)
+        meta = body.get("meta", {})
+        if meta.get("truncated") and meta.get("next_until") and len(tweet_ids) < p.max_tweets_per_handle:
+            until = meta["next_until"]  # continue the walk; dedupe boundary via `seen`
+        else:
+            break
+    entry = {
+        "handle": handle,
+        "user_id": (body.get("profile") or {}).get("id") if body.get("profile") else None,
+        "tweet_ids": tweet_ids[: p.max_tweets_per_handle],
+        "tweets_scanned": len(tweet_ids[: p.max_tweets_per_handle]),
+        "source": "xmd",
+    }
+    if warning:
+        entry["warning"] = warning
+    return entry
+
+
+async def _resolve_handle_grok_x_search(handle: str, since: str, until: str, p: AstroturfMapperInput) -> dict:
+    """Resolve one handle to recent post IDs via xAI's Grok X Search tool.
+
+    Published xAI Responses API route (not a grok.com/X login): x_search scoped with
+    allowed_x_handles + from_date/to_date; the model echoes the x.com post URLs and the
+    numeric tweet IDs are parsed out of them. Billed per post fetched ($5/1k posts as of
+    2026-09, reported in usage.server_side_tool_usage_details) plus tokens — an xAI
+    meter, not X's pay-per-use API.
+    """
+    import httpx
+
+    entry = {"handle": handle, "user_id": None, "tweet_ids": [], "tweets_scanned": 0, "source": "grok_x_search"}
+    api_key = os.environ.get("XAI_API_KEY")
+    if not api_key:
+        entry["warning"] = "XAI_API_KEY not set; grok_x_search source unavailable for this handle"
+        return entry
+    query = f"from:{handle} -is:retweet" + ("" if p.with_replies else " -is:reply")
+    prompt = (
+        f"Use X Search only (no web search). List up to {p.max_tweets_per_handle} original posts by "
+        f"@{handle} posted from {since} through {until} (query: {query}). Reply with ONLY the full x.com "
+        "post URLs (https://x.com/<handle>/status/<id>), one per line, most recent first. This is "
+        "read-only: do not post, reply, like, repost, or follow anything. If no posts are found, reply exactly: NONE"
+    )
+    body = {
+        "model": XAI_XSEARCH_MODEL,
+        "input": [{"role": "user", "content": prompt}],
+        "tools": [{"type": "x_search", "allowed_x_handles": [handle], "from_date": since, "to_date": until}],
+        "max_turns": 2,
+        "stream": False,
+    }
+    async with httpx.AsyncClient(timeout=300.0) as client:
+        r = await client.post(
+            f"{XAI_API_BASE}/responses",
+            json=body,
+            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+        )
+    if r.status_code == 429:
+        raise RuntimeError(
+            f"xAI rate limited on grok x_search for @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
+            "reduce max_tweets_per_handle or check the XAI team rate limits"
+        )
+    if r.status_code in (401, 403):
+        entry["warning"] = "XAI_API_KEY missing or invalid; grok_x_search unavailable for this handle"
+        return entry
+    if r.status_code >= 500:
+        entry["warning"] = f"xAI returned HTTP {r.status_code} for grok x_search on @{handle}"
+        return entry
+    r.raise_for_status()
+    resp = r.json()
+    texts = []
+    for item in resp.get("output", []):
+        if item.get("type") != "message":
+            continue
+        for c in item.get("content", []):
+            if c.get("type") == "output_text":
+                texts.append(c.get("text") or "")
+                for a in c.get("annotations") or []:
+                    if a.get("url"):
+                        texts.append(a["url"])
+    ids = _extract_status_ids("\n".join(texts), handle)
+    usage = (resp.get("usage") or {}).get("server_side_tool_usage_details") or {}
+    entry["tweet_ids"] = ids[: p.max_tweets_per_handle]
+    entry["tweets_scanned"] = len(entry["tweet_ids"])
+    if usage.get("x_posts_fetched"):
+        entry["x_posts_fetched"] = usage["x_posts_fetched"]
+    if not ids:
+        entry["warning"] = f"grok x_search found no posts for @{handle} in the requested window"
+    return entry
+
+
 @workflows.activity(start_to_close_timeout=timedelta(minutes=15), retry_policy_max_attempts=3)
 async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     import httpx
 
     since = (datetime.now(timezone.utc) - timedelta(days=p.lookback_days)).strftime("%Y-%m-%d")
+    until = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")  # x_search to_date is exclusive
+    out = []
+    if p.handle_source == "grok_x_search":
+        for raw in p.target_handles:
+            out.append(await _resolve_handle_grok_x_search(raw.lstrip("@"), since, until, p))
+        return out
     headers = {"Accept": "application/json"}
     api_key = os.environ.get("X_MD_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    out = []
     async with httpx.AsyncClient(base_url="https://mdfromx.com", headers=headers, timeout=300.0) as client:
         for raw in p.target_handles:
             handle = raw.lstrip("@")
-            seen = set()
-            tweet_ids = []
-            until = None
-            body = {}
-            warning = None
-            while len(tweet_ids) < p.max_tweets_per_handle:
-                params = {
-                    "since": since,
-                    "max_posts": min(5000, p.max_tweets_per_handle - len(tweet_ids) + 1),
-                    "format": "json",
-                    "with_replies": "true" if p.with_replies else "false",
-                    "with_reposts": "false",  # reposts are the ORIGINAL author's post — exclude
-                }
-                if until:
-                    params["until"] = until
-                r = await client.get(f"/api/v1/profiles/{handle}/posts", params=params)
-                if r.status_code == 429:
-                    raise RuntimeError(
-                        f"x.md rate limited on @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
-                        "set X_MD_API_KEY for a higher import allowance or reduce max_tweets_per_handle"
-                    )
-                if r.status_code in (403, 404):
-                    warning = "profile not found or not publicly readable via x.md"
-                    break
-                if r.status_code >= 500:
-                    # x.md bulk-import occasionally 500s (e.g. very large profiles); degrade per-handle
-                    warning = f"x.md returned HTTP {r.status_code} for @{handle}; no posts resolved for this handle"
-                    break
-                r.raise_for_status()
-                try:
-                    body = r.json()
-                except ValueError:
-                    warning = f"x.md returned a non-JSON response for @{handle}; no posts resolved for this handle"
-                    break
-                for post in body.get("posts", []):
-                    pid = str(post.get("id") or "")
-                    if pid and pid not in seen:
-                        seen.add(pid)
-                        tweet_ids.append(pid)
-                meta = body.get("meta", {})
-                if meta.get("truncated") and meta.get("next_until") and len(tweet_ids) < p.max_tweets_per_handle:
-                    until = meta["next_until"]  # continue the walk; dedupe boundary via `seen`
-                else:
-                    break
-            entry = {
-                "handle": handle,
-                "user_id": (body.get("profile") or {}).get("id") if body.get("profile") else None,
-                "tweet_ids": tweet_ids[: p.max_tweets_per_handle],
-                "tweets_scanned": len(tweet_ids[: p.max_tweets_per_handle]),
-            }
-            if warning:
-                entry["warning"] = warning
+            entry = await _resolve_handle_xmd(client, handle, since, p)
+            if p.handle_source == "auto" and entry.get("warning"):
+                g = await _resolve_handle_grok_x_search(handle, since, until, p)
+                if g.get("tweet_ids"):
+                    entry["tweet_ids"] = g["tweet_ids"]
+                    entry["tweets_scanned"] = g["tweets_scanned"]
+                    entry["source"] = "auto:xmd-warning+grok_x_search"
+                    entry["warning"] = f"x.md: {entry['warning']}; recovered via grok x_search"
+                    if g.get("x_posts_fetched"):
+                        entry["x_posts_fetched"] = g["x_posts_fetched"]
+                elif g.get("warning"):
+                    entry["warning"] = f"x.md: {entry['warning']}; grok x_search: {g['warning']}"
             out.append(entry)
     return out
 

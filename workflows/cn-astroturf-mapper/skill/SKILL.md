@@ -41,6 +41,7 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
   "max_tweets_per_handle": 500,
   "with_replies": false,
   "with_reposts": false,
+  "handle_source": "xmd",
   "min_notes_for_rater": 3,
   "min_co_rating_overlap": 0.5,
   "min_cluster_size": 5,
@@ -60,6 +61,8 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
 - "last N days" / "past N weeks" / "N months" → `lookback_days`.
 - "include replies" → `with_replies: true`. Never set `with_reposts: true`
   (reposts are other authors' posts).
+- "use Grok/xAI x search instead of x.md" → `handle_source: "grok_x_search"`;
+  "fall back to it when x.md fails" → `handle_source: "auto"`.
 - "more/less sensitive" → lower/raise `min_cluster_size` and
   `min_co_rating_overlap`; "faster/slower burst" → `burst_window_minutes` /
   `burst_min_ratings`.
@@ -68,8 +71,10 @@ Use the connected Mistral connector (`mistral_mcp`) tools:
 
 Summarize for the user from `result`:
 
-- `result.targets`: handles resolved and how many of their posts were scanned
-  via x.md (watch `warning` fields — unreadable/protected profiles).
+- `result.targets`: handles resolved, `source` used (x.md / grok x_search / auto
+  fallback), how many of their posts were scanned, optional `x_posts_fetched`
+  (xAI usage when grok x_search ran), and `warning` fields (unreadable/protected
+  profiles, missing XAI_API_KEY).
 - `result.findings.per_handle[handle]`: `severity` (`none/low/medium/high/
   critical`), `coordination_score` (0–100), `notes_on_their_posts`,
   `clusters` (id, size, mean overlap, pseudonymous member IDs — never resolve
@@ -100,3 +105,10 @@ Summarize for the user from `result`:
   snapshots (`YYYY/MM/DD/<table>/<prefix>-NNNNN.zip` under `CN_DATA_BASE`);
   check `CN_DATA_BASE` / `CN_LOOKBACK_DAYS` / `CN_MAX_SHARDS` if X changed the
   layout.
+- `warning` containing "XAI_API_KEY not set" (with `handle_source`
+  "grok_x_search"/"auto") → add the `XAI_API_KEY` secret to the
+  `cn-astroturf-mapper-worker` deployment — an xAI API key, never an X token or
+  grok.com login.
+- `FAILED` with an xAI `429` rate-limit message → lower `max_tweets_per_handle`
+  or check the xAI team rate limits. x_search is billed per post fetched
+  ($5/1k posts), reported per handle as `x_posts_fetched`.
