@@ -1,0 +1,8 @@
+{
+  "target_handles": ["somehandle", "anotherhandle"],
+  "lookback_days": 90,
+  "max_tweets_per_handle": 500,
+  "with_replies": false,
+  "with_reposts": false,
+  "model": "mistral-large-latest"
+}
