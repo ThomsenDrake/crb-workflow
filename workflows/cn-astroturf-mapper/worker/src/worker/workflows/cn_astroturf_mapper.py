@@ -295,8 +295,16 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
                 if r.status_code in (403, 404):
                     warning = "profile not found or not publicly readable via x.md"
                     break
+                if r.status_code >= 500:
+                    # x.md bulk-import occasionally 500s (e.g. very large profiles); degrade per-handle
+                    warning = f"x.md returned HTTP {r.status_code} for @{handle}; no posts resolved for this handle"
+                    break
                 r.raise_for_status()
-                body = r.json()
+                try:
+                    body = r.json()
+                except ValueError:
+                    warning = f"x.md returned a non-JSON response for @{handle}; no posts resolved for this handle"
+                    break
                 for post in body.get("posts", []):
                     pid = str(post.get("id") or "")
                     if pid and pid not in seen:
