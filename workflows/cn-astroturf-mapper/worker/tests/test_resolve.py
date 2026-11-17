@@ -94,10 +94,11 @@ def test_workflow_init_initializes_interactive_wait_state():
 
 
 class _FakeResp:
-    def __init__(self, status_code, payload=None, headers=None):
+    def __init__(self, status_code, payload=None, headers=None, text=""):
         self.status_code = status_code
         self._payload = payload or {}
         self.headers = headers or {}
+        self.text = text
 
     def json(self):
         return self._payload
@@ -130,6 +131,13 @@ def test_xmd_5xx_and_other_4xx_degrade_to_warning():
         entry = asyncio.run(_resolve_handle_xmd(_FakeClient([_FakeResp(status)]), "hasanthehun", "2026-08-19", _xmd_input()))
         assert entry["tweet_ids"] == []
         assert str(status) in entry["warning"] or status in (403, 404)
+
+
+def test_xmd_5xx_warning_includes_error_body_snippet():
+    resp = _FakeResp(502, text='{\n  "title": "Bad gateway",\n  "detail": "upstream X fetch timed out"\n}')
+    entry = asyncio.run(_resolve_handle_xmd(_FakeClient([resp]), "hasanthehun", "2026-08-19", _xmd_input()))
+    assert "502" in entry["warning"]
+    assert "upstream X fetch timed out" in entry["warning"]
 
 
 def test_xmd_429_still_raises_runtime_error():
