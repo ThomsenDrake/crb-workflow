@@ -17,5 +17,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends nodejs npm ca-c
     && rm -rf /var/lib/apt/lists/*
 ENV GROK_BIN=grok
 ENV GROK_HOME=/root/.grok
+# Self-hosted x.md instance (own import allowance; API key comes from the
+# x_md_api_key workspace secret bound as X_MD_API_KEY at deploy time).
+ENV X_MD_BASE_URL=https://xmd.drake-t.workers.dev
 ENV PYTHONPATH=/app/src
 CMD ["python", "-m", "worker.entrypoints.worker"]
