@@ -385,8 +385,11 @@ async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMappe
             warning = "profile not found or not publicly readable via x.md"
             break
         if r.status_code >= 400:
-            # 5xx bulk-import hiccups and any other 4xx degrade per-handle
+            # 5xx bulk-import hiccups and any other 4xx degrade per-handle; surface the error body
+            detail = " ".join(r.text[:200].split())
             warning = f"x.md returned HTTP {r.status_code} for @{handle}; no posts resolved for this handle"
+            if detail:
+                warning += f" — {detail}"
             break
         try:
             body = r.json()
