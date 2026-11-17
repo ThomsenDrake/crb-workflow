@@ -2,6 +2,8 @@
 import asyncio
 import os
 
+import pytest
+
 from worker.workflows.cn_astroturf_mapper import (
     AstroturfMapperInput,
     _extract_status_ids,
@@ -9,6 +11,7 @@ from worker.workflows.cn_astroturf_mapper import (
     _parse_user_id,
     _post_cap,
     _resolve_handle_grok_cli,
+    _resolve_handle_xmd,
 )
 
 
@@ -88,3 +91,59 @@ def test_workflow_init_initializes_interactive_wait_state():
     w = CnAstroturfMapper()
     assert w._pending_inputs == {}
     assert w._pending_wait_count == 0
+
+
+class _FakeResp:
+    def __init__(self, status_code, payload=None, headers=None):
+        self.status_code = status_code
+        self._payload = payload or {}
+        self.headers = headers or {}
+
+    def json(self):
+        return self._payload
+
+
+class _FakeClient:
+    def __init__(self, responses):
+        self._responses = list(responses)
+        self.requests = []
+
+    async def get(self, url, params=None):
+        self.requests.append((url, params))
+        return self._responses.pop(0)
+
+
+def _xmd_input():
+    return AstroturfMapperInput(target_handles=["hasanthehun"], handle_source="xmd")
+
+
+def test_xmd_401_degrades_to_actionable_warning_not_raise():
+    client = _FakeClient([_FakeResp(401)])
+    entry = asyncio.run(_resolve_handle_xmd(client, "hasanthehun", "2026-08-19", _xmd_input()))
+    assert entry["source"] == "xmd"
+    assert entry["tweet_ids"] == []
+    assert "401" in entry["warning"] and "X_MD_API_KEY" in entry["warning"]
+
+
+def test_xmd_5xx_and_other_4xx_degrade_to_warning():
+    for status in (500, 503, 400, 403, 404):
+        entry = asyncio.run(_resolve_handle_xmd(_FakeClient([_FakeResp(status)]), "hasanthehun", "2026-08-19", _xmd_input()))
+        assert entry["tweet_ids"] == []
+        assert str(status) in entry["warning"] or status in (403, 404)
+
+
+def test_xmd_429_still_raises_runtime_error():
+    with pytest.raises(RuntimeError, match="rate limited"):
+        asyncio.run(_resolve_handle_xmd(_FakeClient([_FakeResp(429, headers={"Retry-After": "60"})]), "hasanthehun", "2026-08-19", _xmd_input()))
+
+
+def test_xmd_200_collects_deduped_ids_and_walks_pages():
+    page1 = _FakeResp(200, {"posts": [{"id": "1"}, {"id": "2"}], "profile": {"id": "42"},
+                            "meta": {"truncated": True, "next_until": "2026-01-01"}})
+    page2 = _FakeResp(200, {"posts": [{"id": "2"}, {"id": "3"}], "meta": {"truncated": False}})
+    client = _FakeClient([page1, page2])
+    entry = asyncio.run(_resolve_handle_xmd(client, "hasanthehun", "2026-08-19", _xmd_input()))
+    assert entry["tweet_ids"] == ["1", "2", "3"]
+    assert entry["user_id"] == "42"
+    assert len(client.requests) == 2
+    assert client.requests[1][1]["until"] == "2026-01-01"

@@ -351,11 +351,12 @@ def _post_cap(p: AstroturfMapperInput) -> int:
 
 
 async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMapperInput) -> dict:
-    """x.md bulk-history route for one handle (see module docs). Degrades to a per-handle warning on 403/404/5xx."""
+    """x.md bulk-history route for one handle (see module docs). Degrades to a per-handle warning on 401/403/404/other 4xx/5xx."""
     seen = set()
     tweet_ids = []
     until = None
     body = {}
+    profile = {}
     warning = None
     cap = _post_cap(p)
     while len(tweet_ids) < cap:
@@ -374,14 +375,19 @@ async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMappe
                 f"x.md rate limited on @{handle} (Retry-After: {r.headers.get('Retry-After', '?')}s); "
                 "set X_MD_API_KEY for a higher import allowance or reduce max_tweets_per_handle"
             )
+        if r.status_code == 401:
+            warning = (
+                f"x.md returned HTTP 401 for @{handle}: X_MD_API_KEY is missing or invalid; "
+                "bind the x_md_api_key secret to this deployment as X_MD_API_KEY"
+            )
+            break
         if r.status_code in (403, 404):
             warning = "profile not found or not publicly readable via x.md"
             break
-        if r.status_code >= 500:
-            # x.md bulk-import occasionally 500s (e.g. very large profiles); degrade per-handle
+        if r.status_code >= 400:
+            # 5xx bulk-import hiccups and any other 4xx degrade per-handle
             warning = f"x.md returned HTTP {r.status_code} for @{handle}; no posts resolved for this handle"
             break
-        r.raise_for_status()
         try:
             body = r.json()
         except ValueError:
@@ -392,6 +398,8 @@ async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMappe
             if pid and pid not in seen:
                 seen.add(pid)
                 tweet_ids.append(pid)
+        if body.get("profile"):
+            profile = body["profile"]  # first page carries the profile record
         meta = body.get("meta", {})
         if meta.get("truncated") and meta.get("next_until") and len(tweet_ids) < cap:
             until = meta["next_until"]  # continue the walk; dedupe boundary via `seen`
@@ -399,7 +407,7 @@ async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMappe
             break
     entry = {
         "handle": handle,
-        "user_id": (body.get("profile") or {}).get("id") if body.get("profile") else None,
+        "user_id": profile.get("id"),
         "tweet_ids": tweet_ids[:cap],
         "tweets_scanned": len(tweet_ids[:cap]),
         "source": "xmd",
@@ -455,10 +463,9 @@ async def _resolve_handle_grok_x_search(handle: str, since: str, until: str, p: 
     if r.status_code in (401, 403):
         entry["warning"] = "XAI_API_KEY missing or invalid; grok_x_search unavailable for this handle"
         return entry
-    if r.status_code >= 500:
+    if r.status_code >= 400:
         entry["warning"] = f"xAI returned HTTP {r.status_code} for grok x_search on @{handle}"
         return entry
-    r.raise_for_status()
     resp = r.json()
     texts = []
     for item in resp.get("output", []):
@@ -644,10 +651,21 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
             handle = raw.lstrip("@")
             if p.handle_source in ("grok_x_search", "grok_cli"):
                 resolver = _resolve_handle_grok_x_search if p.handle_source == "grok_x_search" else _resolve_handle_grok_cli
-                entry = await resolver(handle, since, until, p)
+                try:
+                    entry = await resolver(handle, since, until, p)
+                except RuntimeError:
+                    raise  # 429 stays actionable and fails the run
+                except httpx.HTTPError as e:
+                    entry = {"handle": handle, "user_id": None, "tweet_ids": [], "tweets_scanned": 0,
+                             "source": p.handle_source, "warning": f"resolver request failed for @{handle}: {e}"}
                 if p.handle_source == "grok_cli" and entry.get("warning"):
                     # Grok CLI unavailable/failed for this handle (no binary, not signed in, no posts) -> x.md fallback
-                    x = await _resolve_handle_xmd(client, handle, since, p)
+                    try:
+                        x = await _resolve_handle_xmd(client, handle, since, p)
+                    except RuntimeError:
+                        raise
+                    except httpx.HTTPError as e:
+                        x = {"tweet_ids": [], "warning": f"x.md request failed: {e}"}
                     if x.get("tweet_ids"):
                         entry["tweet_ids"] = x["tweet_ids"]
                         entry["tweets_scanned"] = x["tweets_scanned"]
@@ -659,7 +677,13 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
                         entry["warning"] = f"grok_cli: {entry['warning']}; x.md: {x.get('warning', 'no posts')}"
                 out.append(entry)
                 continue
-            entry = await _resolve_handle_xmd(client, handle, since, p)
+            try:
+                entry = await _resolve_handle_xmd(client, handle, since, p)
+            except RuntimeError:
+                raise  # 429 stays actionable and fails the run
+            except httpx.HTTPError as e:
+                entry = {"handle": handle, "user_id": None, "tweet_ids": [], "tweets_scanned": 0,
+                         "source": "xmd", "warning": f"x.md request failed for @{handle}: {e}"}
             if p.handle_source == "auto" and entry.get("warning"):
                 note = entry["warning"]
                 for g in await _grok_fallbacks(handle, since, until, p):
