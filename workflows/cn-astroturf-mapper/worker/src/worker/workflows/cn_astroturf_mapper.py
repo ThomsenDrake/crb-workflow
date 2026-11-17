@@ -56,6 +56,9 @@ Env vars:
   X_MD_API_KEY    optional x.md API key (Authorization: Bearer). Without it the
                   bulk import is limited to ~3 imports/hour, 5/day per IP; with a
                   key you get your key's import allowance. Never an X token.
+  X_MD_BASE_URL   x.md instance to use (default https://mdfromx.com). Point at a
+                  self-hosted x.md (e.g. https://xmd.drake-t.workers.dev) to use
+                  your own import allowance instead of the shared public one.
   XAI_API_KEY     optional xAI API key enabling the grok_x_search handle source
                   (xAI Responses API x_search tool; billed per post fetched — an
                   xAI meter, not X's pay-per-use API). Never an X token or a
@@ -277,9 +280,9 @@ def score_handle(n_notes: int, clusters: list, bursts: list, flips: list) -> tup
 
 # ── Activity 1: resolve target handles to their recent posts via x.md ────────
 #
-# x.md (https://mdfromx.com/docs) is a read-only, keyless mirror of public X
-# content. Bulk history route:
-#   GET https://mdfromx.com/api/v1/profiles/{handle}/posts
+# x.md (default https://mdfromx.com/docs, override with X_MD_BASE_URL for a
+# self-hosted instance) is a read-only mirror of public X content. Bulk history:
+#   GET {X_MD_BASE_URL}/api/v1/profiles/{handle}/posts
 #       ?since=YYYY-MM-DD&max_posts=N&format=json&with_replies=..&with_reposts=false
 # Response: {"profile": {...}, "posts": [{"id": "<tweet id>", "text": ...,
 # "created_at": ..., "url": "https://x.com/.../status/<id>", ...}],
@@ -287,6 +290,8 @@ def score_handle(n_notes: int, clusters: list, bursts: list, flips: list) -> tup
 # Post `id` is the numeric tweet ID — exactly what joins to the CN dataset's
 # `tweetId` column. Optional X_MD_API_KEY raises the import rate allowance.
 
+
+X_MD_BASE_URL = os.environ.get("X_MD_BASE_URL", "https://mdfromx.com")
 
 XAI_API_BASE = os.environ.get("XAI_API_BASE", "https://api.x.ai/v1")
 XAI_XSEARCH_MODEL = os.environ.get("XAI_XSEARCH_MODEL", "grok-4.7")
@@ -639,7 +644,7 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     api_key = os.environ.get("X_MD_API_KEY")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
-    async with httpx.AsyncClient(base_url="https://mdfromx.com", headers=headers, timeout=300.0) as client:
+    async with httpx.AsyncClient(base_url=X_MD_BASE_URL, headers=headers, timeout=300.0) as client:
         for raw in p.target_handles:
             handle = raw.lstrip("@")
             entry = await _resolve_handle_xmd(client, handle, since, p)
