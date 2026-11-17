@@ -377,8 +377,8 @@ async def _resolve_handle_xmd(client, handle: str, since: str, p: AstroturfMappe
             )
         if r.status_code == 401:
             warning = (
-                f"x.md returned HTTP 401 for @{handle}: X_MD_API_KEY is missing or invalid; "
-                "bind the x_md_api_key secret to this deployment as X_MD_API_KEY"
+                f"x.md returned HTTP 401 for @{handle}: the x.md API key is missing or invalid; "
+                "bind the x_md_api_key secret to this deployment (env var X_MD_API_KEY or x_md_api_key)"
             )
             break
         if r.status_code in (403, 404):
@@ -643,7 +643,7 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
     until = (datetime.now(timezone.utc) + timedelta(days=1)).strftime("%Y-%m-%d")  # x_search to_date is exclusive
     out = []
     headers = {"Accept": "application/json"}
-    api_key = os.environ.get("X_MD_API_KEY")
+    api_key = os.environ.get("X_MD_API_KEY") or os.environ.get("x_md_api_key")
     if api_key:
         headers["Authorization"] = f"Bearer {api_key}"
     async with httpx.AsyncClient(base_url=X_MD_BASE_URL, headers=headers, timeout=300.0) as client:
