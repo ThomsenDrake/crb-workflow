@@ -72,7 +72,7 @@ Create a managed deployment pointing at this repo — Mistral Cloud builds "depl
 - github_url: "https://github.com/ThomsenDrake/dt-personal-workflows", revision: a commit SHA on "main"
 - deployment name: "cn-astroturf-mapper-worker"
 - dockerfile path: "deploy/docker/Dockerfile.cn-astroturf-mapper"
-- secret: "X_MD_API_KEY" bound from the workspace secret "x_md_api_key" (an x.md key, not an X token) — the worker image sets X_MD_BASE_URL to the self-hosted instance, so this key is required there; without it you are limited to ~3 imports/hour per IP on the public instance
+- secret: "x_md_api_key" bound to env var `X_MD_API_KEY` (the worker also accepts lowercase `x_md_api_key`) — an x.md key, not an X token — the worker image sets X_MD_BASE_URL to the self-hosted instance, so this key is required there; without it you are limited to ~3 imports/hour per IP on the public instance
 - secret: "XAI_API_KEY" (optional; an xAI API key enabling `handle_source` "grok_x_search"/"auto" — never an X token or grok.com login)
 - for `handle_source` "grok_cli": the worker image (`deploy/docker/Dockerfile.cn-astroturf-mapper`) now ships the Grok CLI (`npm i -g @xai-official/grok`; `GROK_BIN=grok`, `GROK_HOME=/root/.grok`). No credential is baked in — on the first `grok_cli`/`auto` run with no cached login, the execution pauses on the device-code pending input (see above); complete it once per container lifetime. The workflow never reads or logs the token file
 - Via the Studio console (Workflows → Deployments), the API, or the Mistral MCP "deploy_workflow_deployment" tool
