@@ -35,6 +35,3 @@ deploy/docker/
 - From the repo root, `mistral dev` auto-discovers every worker under `workflows/`; or run one directly, e.g. `cd workflows/ncaa-d1-best-line/worker && uv sync && PYTHONPATH=src uv run python -m worker.entrypoints.worker`.
 - Trigger an execution, e.g. `python workflows/ncaa-d1-best-line/examples/run_execution.py`.
 
-## Disclaimer
-
-These projects are for entertainment and analysis only, do not provide betting advice, and guarantee no outcomes. Only wager what you can afford to lose, in jurisdictions where it is legal, 21+. If gambling is a problem, call or text 1-800-GAMBLER (US).
