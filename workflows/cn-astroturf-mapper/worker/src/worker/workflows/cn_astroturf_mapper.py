@@ -72,8 +72,10 @@ Env vars:
   CN_DATA_BASE      base URL of public CN snapshots
                     (default https://ton.twimg.com/birdwatch-public-data)
   CN_LOOKBACK_DAYS  days to walk back from today to find the latest daily
-                    snapshot (default 7)
-  CN_MAX_SHARDS     max shard index probed per table (default 64)
+                    snapshot (default 10; snapshots lag ~48h)
+  CN_MAX_SHARDS     max shard index probed per table (default 512; the ratings
+                    dump is multiple parts / several GB, so enumerate until a
+                    clean 404 rather than stopping at a small cap)
 """
 from __future__ import annotations
 
@@ -82,7 +84,9 @@ import csv
 import hashlib
 import io
 import json
+import logging
 import os
+import random
 import re
 import tempfile
 import zipfile
@@ -94,6 +98,8 @@ from pydantic import BaseModel, Field
 
 import mistralai.workflows as workflows
 import mistralai.workflows.plugins.mistralai as workflows_mistralai
+
+logger = logging.getLogger(__name__)
 
 # ── Input / output models ─────────────────────────────────────────────────────
 
@@ -708,8 +714,10 @@ async def resolve_target_handles(p: AstroturfMapperInput) -> list[dict]:
 # ── Activities 2-3: pull the public CN dataset, streamed + filtered ──────────
 
 CN_DATA_BASE = os.environ.get("CN_DATA_BASE", "https://ton.twimg.com/birdwatch-public-data")
-CN_MAX_SHARDS = int(os.environ.get("CN_MAX_SHARDS", "64"))
-CN_LOOKBACK_DAYS = int(os.environ.get("CN_LOOKBACK_DAYS", "7"))  # snapshots are daily best-effort; walk back if today's is missing
+CN_MAX_SHARDS = int(os.environ.get("CN_MAX_SHARDS", "512"))
+CN_LOOKBACK_DAYS = int(os.environ.get("CN_LOOKBACK_DAYS", "10"))  # snapshots are daily best-effort with ~48h lag; walk back if today's is missing
+CN_PROBE_MAX_ATTEMPTS = 6  # attempts per shard URL before giving up on it (429/5xx/timeout/network retried with backoff)
+CN_PROBE_BACKOFF_BASE_S = 0.5
 # table -> candidate (dir, prefix) pairs; X has used both camelCase and kebab-case dir names
 CN_TABLES = {
     "notes": [("notes", "notes")],
@@ -718,16 +726,82 @@ CN_TABLES = {
 }
 
 
-async def _shard_urls(client: httpx.AsyncClient, candidates: list) -> list[str]:
+async def _backoff_sleep(attempt: int) -> None:
+    """Exponential backoff with jitter between probe retries (attempt is 0-based)."""
+    delay = min(30.0, CN_PROBE_BACKOFF_BASE_S * (2 ** attempt)) + random.uniform(0.0, 0.5)
+    await asyncio.sleep(delay)
+
+
+def _fill_diag(diag: Optional[dict], info: dict) -> None:
+    if diag is not None:
+        diag.clear()
+        diag.update(info)
+
+
+async def _probe_url_ranged_get(client: httpx.AsyncClient, url: str) -> str:
+    """HEAD returned 405 (method not allowed): fall back to a ranged GET to test existence."""
+    import httpx
+
+    for attempt in range(CN_PROBE_MAX_ATTEMPTS):
+        try:
+            r = await client.get(url, headers={"Range": "bytes=0-0"}, follow_redirects=True)
+        except httpx.HTTPError:
+            r = None
+        if r is not None:
+            if r.status_code in (200, 206):
+                return "ok"
+            if r.status_code == 404:
+                return "not_found"
+            if r.status_code == 416:
+                return "ok"  # object exists but is empty
+        await _backoff_sleep(attempt)
+    return "error"
+
+
+async def _probe_url(client: httpx.AsyncClient, url: str) -> str:
+    """Classify one shard URL.
+
+    Returns "ok" (exists), "not_found" (clean 404 — normal end of contiguous shard
+    enumeration), or "error" (429/5xx/timeout/network, retried with exponential
+    backoff + jitter up to CN_PROBE_MAX_ATTEMPTS before giving up on this URL).
+    HEAD 405 falls back to a ranged GET.
+    """
+    import httpx
+
+    for attempt in range(CN_PROBE_MAX_ATTEMPTS):
+        try:
+            r = await client.head(url, follow_redirects=True)
+        except httpx.HTTPError:
+            r = None
+        if r is not None:
+            if r.status_code == 200:
+                return "ok"
+            if r.status_code == 404:
+                return "not_found"
+            if r.status_code == 405:
+                return await _probe_url_ranged_get(client, url)
+        await _backoff_sleep(attempt)
+    return "error"
+
+
+async def _shard_urls(client: httpx.AsyncClient, candidates: list, diag: Optional[dict] = None) -> list[str]:
     """Resolve the current snapshot's shard URLs for a table.
 
     Layout (as of 2026): {CN_DATA_BASE}/YYYY/MM/DD/<table-dir>/<prefix>-NNNNN.zip,
     one snapshot per day. Walk back up to CN_LOOKBACK_DAYS from today until shard
-    00000 exists, then enumerate contiguous shards. Falls back to the legacy
-    undated layout, then to [] (caller treats that as "no data").
-    """
-    import httpx
+    00000 exists, then enumerate contiguous shards until a clean 404 (or the
+    CN_MAX_SHARDS cap). Falls back to the legacy undated layout.
 
+    Probe outcomes are classified (see _probe_url): 404 ends enumeration, transient
+    errors are retried with backoff, HEAD 405 falls back to a ranged GET. [] is
+    returned ONLY after every candidate dir/layout and every date dir has been
+    exhausted with retries — never silently on a single non-200.
+
+    If `diag` is given it is filled with the resolution details: snapshot_date
+    ("YYYY/MM/DD", "legacy", or None), table_dir, prefix, shard_count, shard_urls,
+    complete (False when enumeration stopped on a transient error or the cap
+    rather than a clean 404).
+    """
     today = datetime.now(timezone.utc).date()
     date_dirs = [(today - timedelta(days=i)).strftime("%Y/%m/%d") for i in range(CN_LOOKBACK_DAYS)]
     date_dirs.append("")  # legacy undated layout
@@ -735,33 +809,84 @@ async def _shard_urls(client: httpx.AsyncClient, candidates: list) -> list[str]:
         for dd in date_dirs:
             base = f"{CN_DATA_BASE}/{dd}" if dd else CN_DATA_BASE
             first = f"{base}/{table_dir}/{prefix}-00000.zip"
-            try:
-                r = await client.head(first, follow_redirects=True)
-                if r.status_code != 200:
-                    continue
-            except httpx.HTTPError:
-                continue
+            if await _probe_url(client, first) != "ok":
+                continue  # no snapshot in this dir (404) or unreachable after retries — try the next
             urls = [first]
+            complete = False
             for i in range(1, CN_MAX_SHARDS):
                 url = f"{base}/{table_dir}/{prefix}-{i:05d}.zip"
-                try:
-                    r = await client.head(url, follow_redirects=True)
-                except httpx.HTTPError:
-                    break
-                if r.status_code == 200:
+                outcome = await _probe_url(client, url)
+                if outcome == "ok":
                     urls.append(url)
                 else:
-                    break  # shards are contiguous from 00000
+                    # "not_found" = clean end of contiguous shards; "error" = retries
+                    # exhausted mid-list, keep the partial and flag it incomplete
+                    complete = outcome == "not_found"
+                    break
+            _fill_diag(diag, {
+                "snapshot_date": dd or "legacy",
+                "table_dir": table_dir,
+                "prefix": prefix,
+                "shard_count": len(urls),
+                "shard_urls": list(urls),
+                "complete": complete,
+            })
             return urls
         # legacy unsharded single file
         single = f"{CN_DATA_BASE}/{table_dir}/{prefix}.zip"
-        try:
-            r = await client.head(single, follow_redirects=True)
-            if r.status_code == 200:
-                return [single]
-        except httpx.HTTPError:
-            pass
+        if await _probe_url(client, single) == "ok":
+            _fill_diag(diag, {
+                "snapshot_date": "legacy",
+                "table_dir": table_dir,
+                "prefix": prefix,
+                "shard_count": 1,
+                "shard_urls": [single],
+                "complete": True,
+            })
+            return [single]
+    _fill_diag(diag, {
+        "snapshot_date": None,
+        "table_dir": candidates[0][0] if candidates else None,
+        "prefix": candidates[0][1] if candidates else None,
+        "shard_count": 0,
+        "shard_urls": [],
+        "complete": False,
+    })
     return []
+
+
+async def _download_shard(client: httpx.AsyncClient, url: str, tmp_path: str) -> None:
+    """Download one shard zip to tmp_path, resuming + retrying transient failures.
+
+    A dropped connection mid-shard (RemoteProtocolError) or a 429/5xx response must not
+    kill the whole load: the next attempt resumes with `Range: bytes=<have>-` and appends
+    (a 200 reply to a Range request means the server ignored it — restart from scratch).
+    Rows are only parsed after the full zip is on disk, so a retry never yields partial data.
+    """
+    import httpx
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(CN_PROBE_MAX_ATTEMPTS):
+        downloaded = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        headers = {"Range": f"bytes={downloaded}-"} if downloaded else None
+        try:
+            async with client.stream("GET", url, headers=headers, follow_redirects=True, timeout=600.0) as resp:
+                if resp.status_code == 200:
+                    mode = "wb"
+                elif resp.status_code == 206 and downloaded:
+                    mode = "ab"  # resumed
+                else:
+                    resp.raise_for_status()
+                with open(tmp_path, mode) as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
+                        f.write(chunk)
+            return
+        except httpx.HTTPError as e:
+            last_exc = e
+            logger.warning("shard download attempt %s/%s failed for %s (have %s bytes): %s", attempt + 1, CN_PROBE_MAX_ATTEMPTS, url, downloaded, e)
+            if attempt < CN_PROBE_MAX_ATTEMPTS - 1:
+                await _backoff_sleep(attempt)
+    raise last_exc  # type: ignore[misc]
 
 
 async def _aiter_tsv_rows(client: httpx.AsyncClient, url: str):
@@ -774,11 +899,7 @@ async def _aiter_tsv_rows(client: httpx.AsyncClient, url: str):
     tmp_path = tmp.name
     tmp.close()
     try:
-        async with client.stream("GET", url, follow_redirects=True, timeout=600.0) as resp:
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
-                    f.write(chunk)
+        await _download_shard(client, url, tmp_path)
         with zipfile.ZipFile(tmp_path) as zf:
             name = next(n for n in zf.namelist() if n.endswith(".tsv"))
             with zf.open(name) as fh:
@@ -793,16 +914,32 @@ async def _aiter_tsv_rows(client: httpx.AsyncClient, url: str):
             pass
 
 
+def _log_source(table: str, source: dict) -> None:
+    logger.info(
+        "cn data source %s: snapshot_date=%s shards=%s complete=%s rows_scanned=%s rows_kept=%s",
+        table,
+        source.get("snapshot_date"),
+        source.get("shard_count"),
+        source.get("complete"),
+        source.get("rows_scanned"),
+        source.get("rows_kept"),
+    )
+
+
 @workflows.activity(start_to_close_timeout=timedelta(hours=2), retry_policy_max_attempts=1)
-async def load_target_notes(target_tweet_ids: set) -> list[dict]:
-    """Notes attached to any target tweet."""
+async def load_target_notes(target_tweet_ids: set) -> dict:
+    """Notes attached to any target tweet, plus the resolved notes-table source info."""
     import httpx
 
+    diag: dict = {}
     async with httpx.AsyncClient(timeout=120.0) as client:
-        urls = await _shard_urls(client, CN_TABLES["notes"])
+        urls = await _shard_urls(client, CN_TABLES["notes"], diag)
+        logger.info("cn source resolved: table=notes snapshot_date=%s shards=%s complete=%s", diag.get("snapshot_date"), diag.get("shard_count"), diag.get("complete"))
         notes = []
+        rows_scanned = 0
         for url in urls:
             async for row in _aiter_tsv_rows(client, url):
+                rows_scanned += 1
                 if row.get("tweetId") in target_tweet_ids:
                     notes.append({
                         "noteId": row.get("noteId"),
@@ -812,20 +949,29 @@ async def load_target_notes(target_tweet_ids: set) -> list[dict]:
                         "classification": row.get("classification"),
                         "summary_excerpt": (row.get("summary") or "")[:300],
                     })
-    return notes
+    source = {**diag, "rows_scanned": rows_scanned, "rows_kept": len(notes)}
+    _log_source("notes", source)
+    return {"notes": notes, "source": source}
 
 
 @workflows.activity(start_to_close_timeout=timedelta(hours=3), retry_policy_max_attempts=1)
 async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> dict:
-    """Ratings + note status history restricted to target notes (streamed)."""
+    """Ratings + note status history restricted to target notes (streamed), plus source info per table."""
     import httpx
 
     ratings_by_note = defaultdict(list)
     status_by_note = defaultdict(list)
+    ratings_diag: dict = {}
+    status_diag: dict = {}
+    ratings_rows_scanned = 0
+    status_rows_scanned = 0
     async with httpx.AsyncClient(timeout=120.0) as client:
         # ratings
-        for url in await _shard_urls(client, CN_TABLES["ratings"]):
+        ratings_urls = await _shard_urls(client, CN_TABLES["ratings"], ratings_diag)
+        logger.info("cn source resolved: table=ratings snapshot_date=%s shards=%s complete=%s", ratings_diag.get("snapshot_date"), ratings_diag.get("shard_count"), ratings_diag.get("complete"))
+        for url in ratings_urls:
             async for row in _aiter_tsv_rows(client, url):
+                ratings_rows_scanned += 1
                 nid = row.get("noteId")
                 if nid in target_note_ids:
                     ratings_by_note[nid].append({
@@ -836,8 +982,11 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> d
                     })
         # status history
         if detect_flips:
-            for url in await _shard_urls(client, CN_TABLES["status"]):
+            status_urls = await _shard_urls(client, CN_TABLES["status"], status_diag)
+            logger.info("cn source resolved: table=status snapshot_date=%s shards=%s complete=%s", status_diag.get("snapshot_date"), status_diag.get("shard_count"), status_diag.get("complete"))
+            for url in status_urls:
                 async for row in _aiter_tsv_rows(client, url):
+                    status_rows_scanned += 1
                     nid = row.get("noteId")
                     if nid in target_note_ids:
                         status = row.get("currentStatus") or row.get("mostRecentNonNMRStatus") or ""
@@ -847,10 +996,29 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> d
                             "createdAtMillis": int(ts or 0),
                             "status": (status or "").upper(),
                         })
+    ratings_source = {
+        **ratings_diag,
+        "rows_scanned": ratings_rows_scanned,
+        "rows_kept": sum(len(v) for v in ratings_by_note.values()),
+    }
+    status_source = (
+        {
+            **status_diag,
+            "rows_scanned": status_rows_scanned,
+            "rows_kept": sum(len(v) for v in status_by_note.values()),
+        }
+        if detect_flips
+        else None
+    )
+    _log_source("ratings", ratings_source)
+    if status_source is not None:
+        _log_source("status", status_source)
     return {
         "ratings_by_note": {k: v for k, v in ratings_by_note.items()},
         "status_by_note": {k: v for k, v in status_by_note.items()},
         "total_ratings_kept": sum(len(v) for v in ratings_by_note.values()),
+        "ratings_source": ratings_source,
+        "status_source": status_source,
     }
 
 
@@ -1039,7 +1207,10 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         target_tweet_ids = {tid for t in targets for tid in t["tweet_ids"]}
 
         self.steps["load_notes"] = "running"
-        notes = await load_target_notes(target_tweet_ids) if target_tweet_ids else []
+        empty_source = {"snapshot_date": None, "table_dir": None, "prefix": None, "shard_count": 0, "shard_urls": [], "complete": False, "rows_scanned": 0, "rows_kept": 0}
+        notes_res = await load_target_notes(target_tweet_ids) if target_tweet_ids else {"notes": [], "source": dict(empty_source)}
+        notes = notes_res["notes"]
+        notes_source = notes_res["source"]
         self.steps["load_notes"] = "done"
 
         target_note_ids = {n["noteId"] for n in notes}
@@ -1047,24 +1218,63 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         self.steps["load_ratings"] = "running"
         data = await load_ratings_and_status(target_note_ids, p.detect_flips) if target_note_ids else {
             "ratings_by_note": {}, "status_by_note": {}, "total_ratings_kept": 0,
+            "ratings_source": dict(empty_source), "status_source": None,
         }
         self.steps["load_ratings"] = "done"
+
+        ratings_source = data.get("ratings_source") or dict(empty_source)
+        status_source = data.get("status_source")
+        notes_shards = notes_source.get("shard_count", 0)
+        # Loud failure instead of a silent score-0 result: if we have target notes
+        # (so the notes table resolved) but the ratings/status tables resolved to
+        # nothing, the run must NOT look like a clean "no coordination" pass.
+        ratings_source_unavailable = bool(
+            target_note_ids
+            and notes_shards > 0
+            and (ratings_source.get("shard_count", 0) == 0 or ratings_source.get("rows_scanned", 0) == 0)
+        )
+        status_source_unavailable = bool(
+            p.detect_flips
+            and target_note_ids
+            and notes_shards > 0
+            and status_source is not None
+            and (status_source.get("shard_count", 0) == 0 or status_source.get("rows_scanned", 0) == 0)
+        )
 
         self.steps["detect"] = "running"
         findings = await detect_coordination(targets, notes, data, p)
         self.steps["detect"] = "done"
 
+        if ratings_source_unavailable:
+            for v in findings["per_handle"].values():
+                v["coordination_score"] = None  # null, not 0: the ratings source was unavailable
+                v["severity"] = "unknown"
+
         self.steps["assess"] = "running"
         assessment = await llm_campaign_assessment(findings, p) if findings["per_handle"] else None
         self.steps["assess"] = "done"
 
-        report_markdown = _render_markdown(targets, findings, assessment, p)
+        data_sources = {
+            "notes": notes_source,
+            "ratings": ratings_source,
+            "status": status_source if status_source is not None else {**empty_source, "disabled": not p.detect_flips},
+        }
+        logger.info("cn-astroturf-mapper data_sources: %s", json.dumps(data_sources, default=str)[:20000])
+        if ratings_source_unavailable:
+            logger.warning("ratings source unavailable: notes table resolved %s shards but ratings resolved %s shards / %s rows scanned", notes_shards, ratings_source.get("shard_count", 0), ratings_source.get("rows_scanned", 0))
+        if status_source_unavailable:
+            logger.warning("noteStatusHistory source unavailable: notes table resolved %s shards but status resolved %s shards", notes_shards, (status_source or {}).get("shard_count", 0))
+
+        report_markdown = _render_markdown(targets, findings, assessment, p, data_sources=data_sources, ratings_source_unavailable=ratings_source_unavailable, status_source_unavailable=status_source_unavailable)
         return {
             "workflow": "cn-astroturf-mapper",
             "params": p.model_dump(),
             "grok_auth": grok_auth,
             "targets": targets,
             "total_ratings_kept": data.get("total_ratings_kept", 0),
+            "data_sources": data_sources,
+            "ratings_source_unavailable": ratings_source_unavailable,
+            "status_source_unavailable": status_source_unavailable,
             "findings": findings,
             "llm_assessment": assessment,
             "report_markdown": report_markdown,
@@ -1077,7 +1287,15 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         }
 
 
-def _render_markdown(targets: list, findings: dict, assessment: Optional[dict], p: AstroturfMapperInput) -> str:
+def _render_markdown(
+    targets: list,
+    findings: dict,
+    assessment: Optional[dict],
+    p: AstroturfMapperInput,
+    data_sources: Optional[dict] = None,
+    ratings_source_unavailable: bool = False,
+    status_source_unavailable: bool = False,
+) -> str:
     lines = [
         "# Community Notes astroturfing map",
         "",
@@ -1085,9 +1303,22 @@ def _render_markdown(targets: list, findings: dict, assessment: Optional[dict], 
         f"- Detection params: clusters>={p.min_cluster_size} raters, Jaccard>={p.min_co_rating_overlap}, "
         f"bursts>={p.burst_min_ratings} ratings/{p.burst_window_minutes}min one-sided>={p.burst_one_sided_ratio}",
         "",
-        "## Per-handle findings",
-        "",
     ]
+    if ratings_source_unavailable:
+        lines += [
+            "> **WARNING: the ratings data source was unavailable for this run** (the notes table resolved, "
+            "but the ratings table resolved 0 shards/rows). Coordination score is null, not 0 — this is NOT a "
+            "clean 'no coordination' result. Re-run when ton.twimg.com is reachable.",
+            "",
+        ]
+    if status_source_unavailable:
+        lines += [
+            "> **WARNING: the noteStatusHistory data source was unavailable for this run**; status-flip detection "
+            "saw no data.",
+            "",
+        ]
+    lines += ["## Per-handle findings", ""]
+
     for h, v in findings["per_handle"].items():
         lines += [
             f"### @{h} — severity: **{v['severity']}** (score {v['coordination_score']}/100)",
@@ -1117,4 +1348,11 @@ def _render_markdown(targets: list, findings: dict, assessment: Optional[dict], 
             lines.append("")
         lines += ["## Caveats", ""]
         lines += [f"- {c}" for c in assessment.get("methodology_caveats", [])]
+    if data_sources:
+        lines += ["", "## Data sources", ""]
+        for table, src in data_sources.items():
+            lines.append(
+                f"- {table}: snapshot={src.get('snapshot_date') or 'none'}, shards={src.get('shard_count', 0)}"
+                f" (complete={src.get('complete')}), rows_scanned={src.get('rows_scanned', 0)}, rows_kept={src.get('rows_kept', 0)}"
+            )
     return "\n".join(lines)
