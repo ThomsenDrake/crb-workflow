@@ -260,3 +260,37 @@ def test_download_shard_gives_up_after_all_attempts(fast_caps, tmp_path):
     with pytest.raises(httpx.HTTPError):
         asyncio.run(mod._download_shard(StreamClient(), "https://cn.test/x.zip", str(tmp_path / "s.zip")))
     assert len(fast_caps) == mod.CN_PROBE_MAX_ATTEMPTS - 1
+
+
+def test_download_shard_resumes_with_range_header_after_drop(fast_caps, tmp_path):
+    seen = []
+    streams = [
+        FakeStream(chunks=[b"abc"], exc=httpx.RemoteProtocolError("dropped")),
+        FakeStream(chunks=[b"def"], status=206),
+    ]
+
+    class StreamClient:
+        def stream(self, method, url, headers=None, **kwargs):
+            seen.append(headers)
+            return streams.pop(0)
+
+    out = tmp_path / "shard.zip"
+    asyncio.run(mod._download_shard(StreamClient(), "https://cn.test/x.zip", str(out)))
+    assert out.read_bytes() == b"abcdef"
+    assert seen[0] is None
+    assert seen[1] == {"Range": "bytes=3-"}
+
+
+def test_download_shard_restarts_when_server_ignores_range(fast_caps, tmp_path):
+    streams = [
+        FakeStream(chunks=[b"abc"], exc=httpx.RemoteProtocolError("dropped")),
+        FakeStream(chunks=[b"abcdef"], status=200),  # server ignored Range -> full body
+    ]
+
+    class StreamClient:
+        def stream(self, method, url, headers=None, **kwargs):
+            return streams.pop(0)
+
+    out = tmp_path / "shard.zip"
+    asyncio.run(mod._download_shard(StreamClient(), "https://cn.test/x.zip", str(out)))
+    assert out.read_bytes() == b"abcdef"  # truncated, not appended

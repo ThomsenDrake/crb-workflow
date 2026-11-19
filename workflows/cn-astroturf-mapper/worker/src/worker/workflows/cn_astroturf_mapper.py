@@ -856,26 +856,34 @@ async def _shard_urls(client: httpx.AsyncClient, candidates: list, diag: Optiona
 
 
 async def _download_shard(client: httpx.AsyncClient, url: str, tmp_path: str) -> None:
-    """Download one shard zip to tmp_path, retrying transient failures with backoff.
+    """Download one shard zip to tmp_path, resuming + retrying transient failures.
 
     A dropped connection mid-shard (RemoteProtocolError) or a 429/5xx response must not
-    kill the whole load — restart the download (rows are only parsed after the full
-    zip is on disk, so a restart never yields partial data).
+    kill the whole load: the next attempt resumes with `Range: bytes=<have>-` and appends
+    (a 200 reply to a Range request means the server ignored it — restart from scratch).
+    Rows are only parsed after the full zip is on disk, so a retry never yields partial data.
     """
     import httpx
 
     last_exc: Optional[Exception] = None
     for attempt in range(CN_PROBE_MAX_ATTEMPTS):
+        downloaded = os.path.getsize(tmp_path) if os.path.exists(tmp_path) else 0
+        headers = {"Range": f"bytes={downloaded}-"} if downloaded else None
         try:
-            async with client.stream("GET", url, follow_redirects=True, timeout=600.0) as resp:
-                resp.raise_for_status()
-                with open(tmp_path, "wb") as f:
+            async with client.stream("GET", url, headers=headers, follow_redirects=True, timeout=600.0) as resp:
+                if resp.status_code == 200:
+                    mode = "wb"
+                elif resp.status_code == 206 and downloaded:
+                    mode = "ab"  # resumed
+                else:
+                    resp.raise_for_status()
+                with open(tmp_path, mode) as f:
                     async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
                         f.write(chunk)
             return
         except httpx.HTTPError as e:
             last_exc = e
-            logger.warning("shard download attempt %s/%s failed for %s: %s", attempt + 1, CN_PROBE_MAX_ATTEMPTS, url, e)
+            logger.warning("shard download attempt %s/%s failed for %s (have %s bytes): %s", attempt + 1, CN_PROBE_MAX_ATTEMPTS, url, downloaded, e)
             if attempt < CN_PROBE_MAX_ATTEMPTS - 1:
                 await _backoff_sleep(attempt)
     raise last_exc  # type: ignore[misc]
