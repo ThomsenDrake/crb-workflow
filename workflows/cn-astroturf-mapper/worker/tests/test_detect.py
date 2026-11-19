@@ -3,6 +3,8 @@ import asyncio
 
 from worker.workflows.cn_astroturf_mapper import (
     AstroturfMapperInput,
+    _denormalize_data,
+    _rater_pid,
     baseline_vs_target_overlap,
     cross_handle_rater_map,
     detect_bursts,
@@ -342,3 +344,48 @@ def test_score_handle_vector_bonus_small_and_capped():
     })
     assert boosted == round(min(base_score + 10.0, 100.0), 1)
     assert score_handle(0, [], [], []) == (0.0, "none")  # unchanged legacy behavior
+
+
+# ── compact cross-activity encoding + live column names ──
+
+
+def test_rater_pid_column_probe():
+    assert _rater_pid({"raterParticipantId": "abc"}) == "abc"  # current noteRatings header
+    assert _rater_pid({"participantId": "def"}) == "def"        # older snapshots
+    assert _rater_pid({}) is None
+
+
+def test_denormalize_compact_ratings_round_trip():
+    data = {
+        "participants": ["r0", "r1"],
+        "ratings_by_note": {"n1": [[0, 100, "H"], [1, 200, "N"], [0, 300, ""]]},
+        "status_by_note": {"n1": [[5, "CURRENTLY_RATED_HELPFUL"]]},
+        "baseline_by_rater": {"0": ["b1", "b2"]},
+    }
+    out = _denormalize_data(data)
+    assert out["ratings_by_note"]["n1"][0] == {"noteId": "n1", "participantId": "r0", "createdAtMillis": 100, "helpfulness": "HELPFUL"}
+    assert out["ratings_by_note"]["n1"][1]["helpfulness"] == "NOT_HELPFUL"
+    assert out["ratings_by_note"]["n1"][2]["helpfulness"] == ""
+    assert out["status_by_note"]["n1"][0] == {"noteId": "n1", "createdAtMillis": 5, "status": "CURRENTLY_RATED_HELPFUL"}
+    assert out["baseline_by_rater"] == {"r0": ["b1", "b2"]}
+
+
+def test_detect_coordination_accepts_compact_load_shape():
+    p, targets, notes, data = _two_handle_fixture()
+    compact = {
+        "participants": [f"r{i}" for i in range(6)],
+        "ratings_by_note": {
+            "n1": [[i, i * 1000, "H"] for i in range(6)],
+            "n2": [[i, i * 1000, "H"] for i in range(6)],
+        },
+        "status_by_note": {},
+        "baseline_by_rater": {str(i): ["b1"] for i in range(6)},
+        "total_ratings_kept": 12,
+        "enrollment_rows": data["enrollment_rows"],
+        "enrollment_source_unavailable": False,
+    }
+    f = asyncio.run(detect_coordination(targets, notes, compact, p))
+    v1 = f["vectors"]["cross_handle_rater_map"]
+    assert v1["summary"]["raters_flagged"] == 6
+    assert v1["rows"][0]["participantId"] == "r0"
+    assert f["all_clusters"][0]["member_participant_ids"] == [f"r{i}" for i in range(6)]

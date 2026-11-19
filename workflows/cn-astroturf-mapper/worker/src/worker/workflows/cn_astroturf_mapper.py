@@ -1436,7 +1436,8 @@ async def load_target_notes(target_tweet_ids: set) -> dict:
                     notes.append({
                         "noteId": row.get("noteId"),
                         "tweetId": row.get("tweetId"),
-                        "author_participant_id": row.get("participantId"),  # pseudonymous only
+                        # notes table header: noteAuthorParticipantId (older snapshots: participantId)
+                        "author_participant_id": row.get("noteAuthorParticipantId") or row.get("participantId"),  # pseudonymous only
                         "createdAtMillis": int(row.get("createdAtMillis") or 0),
                         "classification": row.get("classification"),
                         "summary_excerpt": (row.get("summary") or "")[:300],
@@ -1446,10 +1447,55 @@ async def load_target_notes(target_tweet_ids: set) -> dict:
     return {"notes": notes, "source": source}
 
 
-# V6 baseline: bounded global reservoir of non-target ratings used to recover baseline
-# samples for raters whose target-note rows appear later in the stream than their
-# non-target rows. Memory-capped; never the wholesale table.
-BASELINE_GLOBAL_RESERVOIR_CAP = 200_000
+# V6 baseline caps: at most this many target-note raters get a baseline sample, each
+# capped at baseline_sample_per_rater non-target note IDs — bounds the activity result.
+BASELINE_MAX_RATERS = 1000
+
+# Compact cross-activity encoding (the activity-result event payload is size-capped, so
+# ratings cross the boundary as [participant_index, createdAtMillis, helpfulness_code]
+# rows plus a single "participants" id table — never as one dict per rating row).
+_FULL_TO_HCODE = {"HELPFUL": "H", "SOMEWHAT_HELPFUL": "S", "NOT_HELPFUL": "N"}
+_HCODE_TO_FULL = {"H": "HELPFUL", "S": "SOMEWHAT_HELPFUL", "N": "NOT_HELPFUL"}
+
+
+def _rater_pid(row: dict):
+    """Rater id from a ratings row: noteRatings header is raterParticipantId (older snapshots: participantId)."""
+    return row.get("raterParticipantId") or row.get("participantId")  # pseudonymous only
+
+
+def _denormalize_data(data: dict) -> dict:
+    """Normalize the compact load_ratings_and_status return into the dict-row shape the
+    pure helpers use. Also accepts the plain dict-row shape (used by unit tests)."""
+    participants = data.get("participants")
+    ratings_by_note = {}
+    for nid, rows in (data.get("ratings_by_note") or {}).items():
+        norm = []
+        for r in rows:
+            if isinstance(r, dict):
+                norm.append(r)
+            else:
+                pid = participants[r[0]] if participants is not None else r[0]
+                norm.append({
+                    "noteId": nid,
+                    "participantId": pid,  # pseudonymous only
+                    "createdAtMillis": r[1],
+                    "helpfulness": _HCODE_TO_FULL.get(r[2], r[2]),
+                })
+        ratings_by_note[nid] = norm
+    status_by_note = {}
+    for nid, rows in (data.get("status_by_note") or {}).items():
+        norm = []
+        for r in rows:
+            if isinstance(r, dict):
+                norm.append(r)
+            else:
+                norm.append({"noteId": nid, "createdAtMillis": r[0], "status": r[1]})
+        status_by_note[nid] = norm
+    baseline = {}
+    for k, v in (data.get("baseline_by_rater") or {}).items():
+        pid = participants[int(k)] if participants is not None and str(k).isdigit() else k
+        baseline[pid] = v
+    return {**data, "ratings_by_note": ratings_by_note, "status_by_note": status_by_note, "baseline_by_rater": baseline}
 
 
 @workflows.activity(start_to_close_timeout=timedelta(hours=3), retry_policy_max_attempts=1)
@@ -1457,24 +1503,33 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
     """Ratings + note status history restricted to target notes (streamed), plus source info per table.
 
     While streaming, also keeps a reservoir-style sample of up to `baseline_sample_per_rater`
-    NON-target ratings per target-note rater (V6 baseline/null model). Memory stays bounded:
-    per-rater reservoirs only for raters already seen on target notes, plus one global
-    capped reservoir for the rest.
+    NON-target ratings for up to BASELINE_MAX_RATERS target-note raters (V6 baseline/null
+    model) — memory- and payload-bounded. The return is compact/indexed (see
+    _denormalize_data) so multi-handle runs stay under the activity-result payload cap.
     """
     import httpx
 
-    ratings_by_note = defaultdict(list)
-    status_by_note = defaultdict(list)
+    participants: list = []
+    pidx: dict = {}
+
+    def _index(pid) -> int:
+        i = pidx.get(pid)
+        if i is None:
+            i = len(participants)
+            pidx[pid] = i
+            participants.append(pid)
+        return i
+
+    ratings_by_note = defaultdict(list)  # noteId -> [[pidx, createdAtMillis, hcode], ...]
+    status_by_note = defaultdict(list)   # noteId -> [[createdAtMillis, status], ...]
     ratings_diag: dict = {}
     status_diag: dict = {}
     ratings_rows_scanned = 0
     status_rows_scanned = 0
     rng = random.Random(12345)  # deterministic baseline sampling
     target_raters_seen = set()
-    baseline_by_rater = defaultdict(list)
+    baseline_by_rater = defaultdict(list)  # pidx -> [non-target noteIds]
     baseline_seen = defaultdict(int)
-    global_reservoir = []
-    global_reservoir_seen = 0
     async with httpx.AsyncClient(timeout=120.0) as client:
         # ratings
         ratings_urls = await _shard_urls(client, CN_TABLES["ratings"], ratings_diag)
@@ -1483,33 +1538,26 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
             async for row in _aiter_tsv_rows(client, url):
                 ratings_rows_scanned += 1
                 nid = row.get("noteId")
-                pid = row.get("participantId")
+                pid = _rater_pid(row)
                 if nid in target_note_ids:
-                    target_raters_seen.add(pid)
-                    ratings_by_note[nid].append({
-                        "noteId": nid,
-                        "participantId": pid,  # pseudonymous only
-                        "createdAtMillis": int(row.get("createdAtMillis") or 0),
-                        "helpfulness": (row.get("helpfulnessLevel") or "").upper(),
-                    })
-                elif baseline_sample_per_rater > 0 and pid:
-                    if pid in target_raters_seen:
-                        lst = baseline_by_rater[pid]
-                        baseline_seen[pid] += 1
-                        if len(lst) < baseline_sample_per_rater:
-                            lst.append(nid)
-                        else:
-                            j = rng.randrange(baseline_seen[pid])
-                            if j < baseline_sample_per_rater:
-                                lst[j] = nid
+                    if pid:
+                        target_raters_seen.add(pid)
+                    ratings_by_note[nid].append([
+                        _index(pid) if pid else -1,
+                        int(row.get("createdAtMillis") or 0),
+                        _FULL_TO_HCODE.get((row.get("helpfulnessLevel") or "").upper(), ""),
+                    ])
+                elif (baseline_sample_per_rater > 0 and pid and pid in target_raters_seen
+                        and (pidx[pid] in baseline_by_rater or len(baseline_by_rater) < BASELINE_MAX_RATERS)):
+                    i = pidx[pid]
+                    lst = baseline_by_rater[i]
+                    baseline_seen[i] += 1
+                    if len(lst) < baseline_sample_per_rater:
+                        lst.append(nid)
                     else:
-                        global_reservoir_seen += 1
-                        if len(global_reservoir) < BASELINE_GLOBAL_RESERVOIR_CAP:
-                            global_reservoir.append((pid, nid))
-                        else:
-                            j = rng.randrange(global_reservoir_seen)
-                            if j < BASELINE_GLOBAL_RESERVOIR_CAP:
-                                global_reservoir[j] = (pid, nid)
+                        j = rng.randrange(baseline_seen[i])
+                        if j < baseline_sample_per_rater:
+                            lst[j] = nid
         # status history
         if detect_flips:
             status_urls = await _shard_urls(client, CN_TABLES["status"], status_diag)
@@ -1521,19 +1569,9 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
                     if nid in target_note_ids:
                         status = row.get("currentStatus") or row.get("mostRecentNonNMRStatus") or ""
                         ts = row.get("timestampMillisOfCurrentStatus") or row.get("createdAtMillis") or 0
-                        status_by_note[nid].append({
-                            "noteId": nid,
-                            "createdAtMillis": int(ts or 0),
-                            "status": (status or "").upper(),
-                        })
+                        status_by_note[nid].append([int(ts or 0), (status or "").upper()])
     if baseline_sample_per_rater > 0:
-        # merge the global reservoir for raters whose target rows came later, then cap per rater
-        for pid, nid in global_reservoir:
-            if pid in target_raters_seen:
-                lst = baseline_by_rater[pid]
-                if len(lst) < baseline_sample_per_rater:
-                    lst.append(nid)
-        baseline_by_rater = {r: lst[:baseline_sample_per_rater] for r, lst in baseline_by_rater.items()}
+        baseline_by_rater = {i: lst[:baseline_sample_per_rater] for i, lst in baseline_by_rater.items()}
     else:
         baseline_by_rater = {}
     ratings_source = {
@@ -1554,10 +1592,11 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool, base
     if status_source is not None:
         _log_source("status", status_source)
     return {
+        "participants": participants,
         "ratings_by_note": {k: v for k, v in ratings_by_note.items()},
         "status_by_note": {k: v for k, v in status_by_note.items()},
         "total_ratings_kept": sum(len(v) for v in ratings_by_note.values()),
-        "baseline_by_rater": dict(baseline_by_rater),
+        "baseline_by_rater": {i: v for i, v in baseline_by_rater.items()},
         "baseline_rows_kept": sum(len(v) for v in baseline_by_rater.values()),
         "ratings_source": ratings_source,
         "status_source": status_source,
@@ -1584,7 +1623,7 @@ async def load_enrollment_for_raters(participant_ids: set) -> dict:
         for url in urls:
             async for row in _aiter_tsv_rows(client, url):
                 rows_scanned += 1
-                pid = row.get("participantId")
+                pid = row.get("participantId") or row.get("raterParticipantId")
                 if pid in want:
                     rows.append({
                         "participantId": pid,  # pseudonymous only
@@ -1600,6 +1639,7 @@ async def load_enrollment_for_raters(participant_ids: set) -> dict:
 
 @workflows.activity(start_to_close_timeout=timedelta(minutes=30), retry_policy_max_attempts=2)
 async def detect_coordination(targets: list, notes: list, data: dict, p: AstroturfMapperInput) -> dict:
+    data = _denormalize_data(data)  # compact indexed load -> dict rows (tests may pass dict rows directly)
     tweet_to_handle = {}
     for t in targets:
         for tid in t["tweet_ids"]:
@@ -1657,8 +1697,14 @@ async def detect_coordination(targets: list, notes: list, data: dict, p: Astrotu
             min_cluster_size=p.min_cluster_size,
             min_notes=p.min_notes_for_rater,
         )
-        v2["direction_clusters"] = direction_clusters[:max_rows]
+        v2["direction_clusters"] = [
+            {**c,
+             "member_participant_ids": c["member_participant_ids"][:max_rows],
+             "notes_covered": c["notes_covered"][:max_rows]}
+            for c in direction_clusters[:max_rows]
+        ]
         v2["summary"]["direction_clusters_flagged"] = len(direction_clusters)
+        v2["flagged_participant_ids"] = v2["flagged_participant_ids"][:max_rows]
         vectors["direction_lockstep"] = v2
 
     v3 = None
@@ -1934,7 +1980,7 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
 
         self.steps["load_ratings"] = "running"
         data = await load_ratings_and_status(target_note_ids, p.detect_flips, p.baseline_sample_per_rater) if target_note_ids else {
-            "ratings_by_note": {}, "status_by_note": {}, "total_ratings_kept": 0,
+            "participants": [], "ratings_by_note": {}, "status_by_note": {}, "total_ratings_kept": 0,
             "baseline_by_rater": {}, "baseline_rows_kept": 0,
             "ratings_source": dict(empty_source), "status_source": None,
         }
@@ -1962,7 +2008,7 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         # V3 enrollment cohorts: participantId set first (already in memory), then the
         # userEnrollment shards are streamed and filtered on it — never loaded wholesale.
         enrollment_enabled = _vector_enabled(p, "enrollment_cohorts")
-        participant_ids = {r["participantId"] for rs in data["ratings_by_note"].values() for r in rs}
+        participant_ids = {pid for pid in (data.get("participants") or []) if pid}
         if enrollment_enabled and participant_ids and target_note_ids:
             enrollment_res = await load_enrollment_for_raters(participant_ids)
         else:
