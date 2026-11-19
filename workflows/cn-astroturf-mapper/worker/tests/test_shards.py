@@ -208,3 +208,55 @@ def test_legacy_unsharded_single_file_fallback(fast_caps):
     assert diag["snapshot_date"] == "legacy"
     assert diag["shard_count"] == 1
     assert diag["complete"] is True
+
+
+class FakeStream:
+    def __init__(self, chunks=(), exc=None, status=200):
+        self._chunks = list(chunks)
+        self._exc = exc
+        self.status_code = status
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *args):
+        return False
+
+    def raise_for_status(self):
+        if self.status_code >= 400:
+            raise httpx.HTTPStatusError("http error", request=None, response=self)
+
+    async def aiter_bytes(self, chunk_size=1 << 20):
+        for c in self._chunks:
+            yield c
+        if self._exc is not None:
+            raise self._exc
+
+
+def test_download_shard_retries_dropped_connection(fast_caps, tmp_path):
+    streams = [
+        FakeStream(chunks=[b"abc"], exc=httpx.RemoteProtocolError("peer closed connection")),
+        FakeStream(chunks=[b"abc", b"def"]),
+    ]
+    calls = []
+
+    class StreamClient:
+        def stream(self, method, url, **kwargs):
+            calls.append(url)
+            return streams.pop(0)
+
+    out = tmp_path / "shard.zip"
+    asyncio.run(mod._download_shard(StreamClient(), "https://cn.test/x.zip", str(out)))
+    assert out.read_bytes() == b"abcdef"  # restarted download, no partial data
+    assert len(calls) == 2
+    assert len(fast_caps) == 1
+
+
+def test_download_shard_gives_up_after_all_attempts(fast_caps, tmp_path):
+    class StreamClient:
+        def stream(self, method, url, **kwargs):
+            return FakeStream(exc=httpx.ConnectError("down"))
+
+    with pytest.raises(httpx.HTTPError):
+        asyncio.run(mod._download_shard(StreamClient(), "https://cn.test/x.zip", str(tmp_path / "s.zip")))
+    assert len(fast_caps) == mod.CN_PROBE_MAX_ATTEMPTS - 1

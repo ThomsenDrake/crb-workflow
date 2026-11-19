@@ -855,6 +855,32 @@ async def _shard_urls(client: httpx.AsyncClient, candidates: list, diag: Optiona
     return []
 
 
+async def _download_shard(client: httpx.AsyncClient, url: str, tmp_path: str) -> None:
+    """Download one shard zip to tmp_path, retrying transient failures with backoff.
+
+    A dropped connection mid-shard (RemoteProtocolError) or a 429/5xx response must not
+    kill the whole load — restart the download (rows are only parsed after the full
+    zip is on disk, so a restart never yields partial data).
+    """
+    import httpx
+
+    last_exc: Optional[Exception] = None
+    for attempt in range(CN_PROBE_MAX_ATTEMPTS):
+        try:
+            async with client.stream("GET", url, follow_redirects=True, timeout=600.0) as resp:
+                resp.raise_for_status()
+                with open(tmp_path, "wb") as f:
+                    async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
+                        f.write(chunk)
+            return
+        except httpx.HTTPError as e:
+            last_exc = e
+            logger.warning("shard download attempt %s/%s failed for %s: %s", attempt + 1, CN_PROBE_MAX_ATTEMPTS, url, e)
+            if attempt < CN_PROBE_MAX_ATTEMPTS - 1:
+                await _backoff_sleep(attempt)
+    raise last_exc  # type: ignore[misc]
+
+
 async def _aiter_tsv_rows(client: httpx.AsyncClient, url: str):
     """Async generator streaming a zipped TSV shard row-by-row (dict rows keyed by header).
 
@@ -865,11 +891,7 @@ async def _aiter_tsv_rows(client: httpx.AsyncClient, url: str):
     tmp_path = tmp.name
     tmp.close()
     try:
-        async with client.stream("GET", url, follow_redirects=True, timeout=600.0) as resp:
-            resp.raise_for_status()
-            with open(tmp_path, "wb") as f:
-                async for chunk in resp.aiter_bytes(chunk_size=1 << 20):
-                    f.write(chunk)
+        await _download_shard(client, url, tmp_path)
         with zipfile.ZipFile(tmp_path) as zf:
             name = next(n for n in zf.namelist() if n.endswith(".tsv"))
             with zf.open(name) as fh:
@@ -904,6 +926,7 @@ async def load_target_notes(target_tweet_ids: set) -> dict:
     diag: dict = {}
     async with httpx.AsyncClient(timeout=120.0) as client:
         urls = await _shard_urls(client, CN_TABLES["notes"], diag)
+        logger.info("cn source resolved: table=notes snapshot_date=%s shards=%s complete=%s", diag.get("snapshot_date"), diag.get("shard_count"), diag.get("complete"))
         notes = []
         rows_scanned = 0
         for url in urls:
@@ -936,7 +959,9 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> d
     status_rows_scanned = 0
     async with httpx.AsyncClient(timeout=120.0) as client:
         # ratings
-        for url in await _shard_urls(client, CN_TABLES["ratings"], ratings_diag):
+        ratings_urls = await _shard_urls(client, CN_TABLES["ratings"], ratings_diag)
+        logger.info("cn source resolved: table=ratings snapshot_date=%s shards=%s complete=%s", ratings_diag.get("snapshot_date"), ratings_diag.get("shard_count"), ratings_diag.get("complete"))
+        for url in ratings_urls:
             async for row in _aiter_tsv_rows(client, url):
                 ratings_rows_scanned += 1
                 nid = row.get("noteId")
@@ -949,7 +974,9 @@ async def load_ratings_and_status(target_note_ids: set, detect_flips: bool) -> d
                     })
         # status history
         if detect_flips:
-            for url in await _shard_urls(client, CN_TABLES["status"], status_diag):
+            status_urls = await _shard_urls(client, CN_TABLES["status"], status_diag)
+            logger.info("cn source resolved: table=status snapshot_date=%s shards=%s complete=%s", status_diag.get("snapshot_date"), status_diag.get("shard_count"), status_diag.get("complete"))
+            for url in status_urls:
                 async for row in _aiter_tsv_rows(client, url):
                     status_rows_scanned += 1
                     nid = row.get("noteId")
