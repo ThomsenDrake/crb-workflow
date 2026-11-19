@@ -20,5 +20,10 @@ ENV GROK_HOME=/root/.grok
 # Self-hosted x.md instance (own import allowance; API key comes from the
 # x_md_api_key workspace secret bound as X_MD_API_KEY at deploy time).
 ENV X_MD_BASE_URL=https://xmd.drake-t.workers.dev
+# Public CN dataset probing caps: daily snapshots lag ~48h (walk back further),
+# and the ratings dump is multiple parts / several GB (probe many shards and
+# enumerate until a clean 404 instead of stopping at a small cap).
+ENV CN_MAX_SHARDS=512
+ENV CN_LOOKBACK_DAYS=10
 ENV PYTHONPATH=/app/src
 CMD ["python", "-m", "worker.entrypoints.worker"]
