@@ -381,7 +381,7 @@ def test_detect_coordination_accepts_compact_load_shape():
         "status_by_note": {},
         "baseline_by_rater": {str(i): ["b1"] for i in range(6)},
         "total_ratings_kept": 12,
-        "enrollment_rows": data["enrollment_rows"],
+        "enrollment_ms": [1_700_000_000_000] * 6,  # index-aligned ts list (payload cap)
         "enrollment_source_unavailable": False,
     }
     f = asyncio.run(detect_coordination(targets, notes, compact, p))
@@ -389,3 +389,6 @@ def test_detect_coordination_accepts_compact_load_shape():
     assert v1["summary"]["raters_flagged"] == 6
     assert v1["rows"][0]["participantId"] == "r0"
     assert f["all_clusters"][0]["member_participant_ids"] == [f"r{i}" for i in range(6)]
+    # enrollment_ms was expanded back into rows (all 6 on the same UTC day; cohort < 10 not flagged)
+    assert f["vectors"]["enrollment_cohorts"]["summary"]["raters_with_enrollment"] == 6
+    assert f["vectors"]["enrollment_cohorts"]["summary"]["cohorts_flagged"] == 0

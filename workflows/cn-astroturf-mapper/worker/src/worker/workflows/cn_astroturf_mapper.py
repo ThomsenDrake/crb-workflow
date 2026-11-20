@@ -1467,6 +1467,13 @@ def _denormalize_data(data: dict) -> dict:
     """Normalize the compact load_ratings_and_status return into the dict-row shape the
     pure helpers use. Also accepts the plain dict-row shape (used by unit tests)."""
     participants = data.get("participants")
+    enrollment_rows = data.get("enrollment_rows")
+    if enrollment_rows is None and data.get("enrollment_ms") is not None and participants is not None:
+        # enrollment crossed the boundary as an index-aligned ts list (payload-size cap)
+        enrollment_rows = [
+            {"participantId": participants[i], "createdAtMillis": ts}
+            for i, ts in enumerate(data["enrollment_ms"]) if ts
+        ]
     ratings_by_note = {}
     for nid, rows in (data.get("ratings_by_note") or {}).items():
         norm = []
@@ -1495,7 +1502,8 @@ def _denormalize_data(data: dict) -> dict:
     for k, v in (data.get("baseline_by_rater") or {}).items():
         pid = participants[int(k)] if participants is not None and str(k).isdigit() else k
         baseline[pid] = v
-    return {**data, "ratings_by_note": ratings_by_note, "status_by_note": status_by_note, "baseline_by_rater": baseline}
+    return {**data, "ratings_by_note": ratings_by_note, "status_by_note": status_by_note,
+            "baseline_by_rater": baseline, "enrollment_rows": enrollment_rows or []}
 
 
 @workflows.activity(start_to_close_timeout=timedelta(hours=3), retry_policy_max_attempts=1)
@@ -1616,6 +1624,7 @@ async def load_enrollment_for_raters(participant_ids: set) -> dict:
     diag: dict = {}
     rows = []
     rows_scanned = 0
+    time_cols_used = set()
     async with httpx.AsyncClient(timeout=120.0) as client:
         urls = await _shard_urls(client, CN_TABLES["enrollment"], diag)
         logger.info("cn source resolved: table=enrollment snapshot_date=%s shards=%s complete=%s", diag.get("snapshot_date"), diag.get("shard_count"), diag.get("complete"))
@@ -1625,11 +1634,21 @@ async def load_enrollment_for_raters(participant_ids: set) -> dict:
                 rows_scanned += 1
                 pid = row.get("participantId") or row.get("raterParticipantId")
                 if pid in want:
+                    # older snapshots carry createdAtMillis (account/enrollment creation);
+                    # current snapshots dropped it — timestampOfLastStateChange is the fallback
+                    ts = row.get("createdAtMillis")
+                    col = "createdAtMillis"
+                    if not ts:
+                        ts = row.get("timestampOfLastStateChange")
+                        col = "timestampOfLastStateChange"
+                    if ts:
+                        time_cols_used.add(col)
                     rows.append({
                         "participantId": pid,  # pseudonymous only
-                        "createdAtMillis": int(row.get("createdAtMillis") or 0),
+                        "createdAtMillis": int(ts or 0),
                     })
-    source = {**diag, "rows_scanned": rows_scanned, "rows_kept": len(rows)}
+    source = {**diag, "rows_scanned": rows_scanned, "rows_kept": len(rows),
+              "time_column_used": sorted(time_cols_used) or None}
     _log_source("enrollment", source)
     return {"rows": rows, "source": source}
 
@@ -1981,7 +2000,7 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         self.steps["load_ratings"] = "running"
         data = await load_ratings_and_status(target_note_ids, p.detect_flips, p.baseline_sample_per_rater) if target_note_ids else {
             "participants": [], "ratings_by_note": {}, "status_by_note": {}, "total_ratings_kept": 0,
-            "baseline_by_rater": {}, "baseline_rows_kept": 0,
+            "baseline_by_rater": {}, "baseline_rows_kept": 0, "enrollment_ms": [],
             "ratings_source": dict(empty_source), "status_source": None,
         }
         self.steps["load_ratings"] = "done"
@@ -2008,13 +2027,17 @@ class CnAstroturfMapper(workflows.InteractiveWorkflow):
         # V3 enrollment cohorts: participantId set first (already in memory), then the
         # userEnrollment shards are streamed and filtered on it — never loaded wholesale.
         enrollment_enabled = _vector_enabled(p, "enrollment_cohorts")
-        participant_ids = {pid for pid in (data.get("participants") or []) if pid}
+        participants = [pid for pid in (data.get("participants") or []) if pid]
+        participant_ids = set(participants)
         if enrollment_enabled and participant_ids and target_note_ids:
             enrollment_res = await load_enrollment_for_raters(participant_ids)
         else:
             enrollment_res = {"rows": [], "source": dict(empty_source)}
         enrollment_source = enrollment_res["source"]
-        data["enrollment_rows"] = enrollment_res["rows"]
+        # index-aligned ts list instead of full rows: keeps the detect activity input
+        # under the payload cap on multi-handle runs (detect rebuilds rows via participants)
+        ts_by_pid = {r["participantId"]: r.get("createdAtMillis") or 0 for r in enrollment_res["rows"]}
+        data["enrollment_ms"] = [ts_by_pid.get(pid, 0) for pid in participants]
         data["enrollment_source_unavailable"] = bool(
             enrollment_enabled
             and participant_ids
