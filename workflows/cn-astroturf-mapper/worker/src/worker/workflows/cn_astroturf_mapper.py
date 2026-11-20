@@ -1448,8 +1448,9 @@ async def load_target_notes(target_tweet_ids: set) -> dict:
 
 
 # V6 baseline caps: at most this many target-note raters get a baseline sample, each
-# capped at baseline_sample_per_rater non-target note IDs — bounds the activity result.
-BASELINE_MAX_RATERS = 1000
+# capped at baseline_sample_per_rater non-target note IDs — bounds the activity result
+# and keeps the detect_coordination input under the 2MB payload cap on multi-handle runs.
+BASELINE_MAX_RATERS = 400
 
 # Compact cross-activity encoding (the activity-result event payload is size-capped, so
 # ratings cross the boundary as [participant_index, createdAtMillis, helpfulness_code]
